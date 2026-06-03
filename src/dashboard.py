@@ -89,6 +89,8 @@ class Dashboard:
         self._font_med   = None
         self._font_small = None
         self._font_tiny  = None
+        self._calibration_requested = False
+        self._calibration_button_rect = None
 
         if not _PYGAME_AVAILABLE:
             return
@@ -147,6 +149,9 @@ class Dashboard:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self._running = False
                 return
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self._calibration_button_rect and self._calibration_button_rect.collidepoint(event.pos):
+                    self._calibration_requested = True
 
         colour = COLOURS.get(alert_level, COLOURS[0])
         self._screen.fill(BG_COLOUR)
@@ -403,8 +408,22 @@ class Dashboard:
         status_colour = COLOURS[alert_level] if alert_level else TEXT_SECONDARY
         dot_x = 14
         pygame.draw.circle(self._screen, status_colour, (dot_x, self.TOP_BAR_H // 2), 5)
-        s = self._fit_text(status, self._font_tiny, self._width - 42, TEXT_PRIMARY)
+        self._calibration_button_rect = pygame.Rect(self._width - 64, 6, 50, 22)
+        s = self._fit_text(status, self._font_tiny, self._width - 106, TEXT_PRIMARY)
         self._screen.blit(s, (28, self.TOP_BAR_H // 2 - s.get_height() // 2))
+        self._draw_calibration_button()
+
+    def _draw_calibration_button(self):
+        rect = self._calibration_button_rect
+        if rect is None:
+            return
+        pygame.draw.rect(self._screen, PANEL_COLOUR, rect, border_radius=6)
+        pygame.draw.rect(self._screen, PANEL_BORDER, rect, width=1, border_radius=6)
+        label = self._font_tiny.render("CAL", True, TEXT_SECONDARY)
+        self._screen.blit(
+            label,
+            (rect.centerx - label.get_width() // 2, rect.centery - label.get_height() // 2),
+        )
 
     def _draw_score_gauge(self, x: int, y: int, score: float, alert_level: int, alert_reason: str = None):
         colour = COLOURS.get(alert_level, COLOURS[0])
@@ -556,6 +575,11 @@ class Dashboard:
 
     def is_running(self) -> bool:
         return self._running
+
+    def consume_calibration_request(self) -> bool:
+        requested = self._calibration_requested
+        self._calibration_requested = False
+        return requested
 
     def quit(self):
         if _PYGAME_AVAILABLE:

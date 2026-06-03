@@ -308,6 +308,20 @@ def main():
     fps_display = 0.0
     start_time  = time.perf_counter()
 
+    def run_requested_calibration():
+        nonlocal fps_timer, fps_count, fps_display, start_time
+        if not dashboard.consume_calibration_request():
+            return
+        log.info("Dashboard calibration button pressed.")
+        alert.update(0)
+        _run_guided_calibration(camera, detector, extractor, dashboard, simulate)
+        scorer.reset()
+        state_machine.reset()
+        fps_timer = time.perf_counter()
+        fps_count = 0
+        fps_display = 0.0
+        start_time = time.perf_counter()
+
     while running:
         loop_start = time.perf_counter()
         t = loop_start - start_time
@@ -330,6 +344,7 @@ def main():
                 alert_reason= reason if alert_level > 0 else None,
                 perclos     = scorer.details.perclos,
             )
+            run_requested_calibration()
             time.sleep(1.0 / max(FRAME_RATE, 1))
             if not dashboard.is_running():
                 running = False
@@ -382,6 +397,7 @@ def main():
             alert_reason= reason if alert_level > 0 else None,
             perclos     = scorer.details.perclos,
         )
+        run_requested_calibration()
 
         if not dashboard.is_running():
             running = False

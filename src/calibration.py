@@ -15,6 +15,13 @@ from statistics import median
 from config.config import LOG_DIR
 
 
+DEFAULT_FACE_CALIBRATION = {
+    "EAR_THRESHOLD": 0.13,
+    "MAR_THRESHOLD": 0.45,
+    "HEAD_PITCH_THRESHOLD": 20.0,
+}
+
+
 @dataclass(frozen=True)
 class CalibrationStep:
     key: str
@@ -111,7 +118,10 @@ class GuidedCalibrator:
             f"EAR threshold: {rec['EAR_THRESHOLD']:.3f}",
             f"MAR threshold: {rec['MAR_THRESHOLD']:.3f}",
             f"Head pitch threshold: {rec['HEAD_PITCH_THRESHOLD']:.1f}",
+            f"Confidence: {rec['confidence']}",
         ]
+        if rec["warnings"]:
+            lines.append(f"Warning: {rec['warnings'][0]}")
         if self._saved_path:
             lines.append(f"Saved to: {self._saved_path}")
         return lines
@@ -131,36 +141,90 @@ class GuidedCalibrator:
         return path
 
     def _compute_recommendations(self):
-        neutral = self._samples["neutral"]
-        eyes_closed = self._samples["eyes_closed"]
-        yawn = self._samples["yawn"]
-        head_nod = self._samples["head_nod"]
+        return calibrate_face_parameters(self._samples)
 
-        neutral_ear = _median_attr(neutral, "ear", fallback=0.17)
-        closed_ear = _low_attr(eyes_closed, "ear", fallback=neutral_ear * 0.55)
-        ear_threshold = _clamp((neutral_ear + closed_ear) / 2.0, 0.08, 0.28)
 
-        neutral_mar = _median_attr(neutral, "mar", fallback=0.12)
-        yawn_mar = _high_attr(yawn, "mar", fallback=max(0.45, neutral_mar * 3.0))
-        mar_threshold = _clamp((neutral_mar + yawn_mar) / 2.0, 0.25, 0.75)
+def calibrate_face_parameters(samples_by_phase, min_samples: int = 15):
+    """
+    Compute personalised face thresholds from guided calibration samples.
 
-        neutral_pitch = _median_attr(neutral, "head_pitch", fallback=0.0)
-        nod_pitch = _high_attr(head_nod, "head_pitch", fallback=neutral_pitch + 20.0)
-        pitch_threshold = _clamp((neutral_pitch + nod_pitch) / 2.0, 10.0, 35.0)
+    Expected phases:
+      neutral      - eyes open, relaxed mouth, upright head
+      eyes_closed  - deliberate eye closure / slow blinks
+      yawn         - mouth open as if yawning
+      head_nod     - head tilted forward
 
-        return {
-            "EAR_THRESHOLD": round(ear_threshold, 3),
-            "MAR_THRESHOLD": round(mar_threshold, 3),
-            "HEAD_PITCH_THRESHOLD": round(pitch_threshold, 1),
-            "baselines": {
-                "neutral_ear": round(neutral_ear, 3),
-                "closed_ear": round(closed_ear, 3),
-                "neutral_mar": round(neutral_mar, 3),
-                "yawn_mar": round(yawn_mar, 3),
-                "neutral_pitch": round(neutral_pitch, 1),
-                "nod_pitch": round(nod_pitch, 1),
-            },
-        }
+    Returns a JSON-serialisable dict with threshold recommendations,
+    measured baselines, sample counts, quality warnings, and confidence.
+    """
+    neutral = list(samples_by_phase.get("neutral", []))
+    eyes_closed = list(samples_by_phase.get("eyes_closed", []))
+    yawn = list(samples_by_phase.get("yawn", []))
+    head_nod = list(samples_by_phase.get("head_nod", []))
+    warnings = []
+
+    neutral_ear = _median_attr(neutral, "ear", fallback=0.17)
+    open_ear_floor = _low_attr(neutral, "ear", fallback=neutral_ear)
+    closed_ear = _low_attr(eyes_closed, "ear", fallback=neutral_ear * 0.55)
+    if closed_ear >= open_ear_floor:
+        warnings.append("Eye calibration samples are not well separated")
+        ear_threshold = DEFAULT_FACE_CALIBRATION["EAR_THRESHOLD"]
+    else:
+        # Bias slightly toward the closed-eye side so normal open-eye variance
+        # does not trigger false positives.
+        ear_threshold = closed_ear + (open_ear_floor - closed_ear) * 0.45
+    ear_threshold = _clamp(ear_threshold, 0.08, 0.28)
+
+    neutral_mar = _median_attr(neutral, "mar", fallback=0.12)
+    resting_mar_ceiling = _high_attr(neutral, "mar", fallback=neutral_mar)
+    yawn_mar = _high_attr(yawn, "mar", fallback=max(0.45, neutral_mar * 3.0))
+    if yawn_mar <= resting_mar_ceiling:
+        warnings.append("Mouth calibration samples are not well separated")
+        mar_threshold = DEFAULT_FACE_CALIBRATION["MAR_THRESHOLD"]
+    else:
+        mar_threshold = resting_mar_ceiling + (yawn_mar - resting_mar_ceiling) * 0.55
+    mar_threshold = _clamp(mar_threshold, 0.25, 0.75)
+
+    neutral_pitch = _median_attr(neutral, "head_pitch", fallback=0.0)
+    neutral_pitch_ceiling = _high_attr(neutral, "head_pitch", fallback=neutral_pitch)
+    nod_pitch = _high_attr(head_nod, "head_pitch", fallback=neutral_pitch + 20.0)
+    if nod_pitch <= neutral_pitch_ceiling:
+        warnings.append("Head nod calibration samples are not well separated")
+        pitch_threshold = DEFAULT_FACE_CALIBRATION["HEAD_PITCH_THRESHOLD"]
+    else:
+        pitch_threshold = neutral_pitch_ceiling + (nod_pitch - neutral_pitch_ceiling) * 0.55
+    pitch_threshold = _clamp(pitch_threshold, 10.0, 35.0)
+
+    sample_counts = {
+        "neutral": len(neutral),
+        "eyes_closed": len(eyes_closed),
+        "yawn": len(yawn),
+        "head_nod": len(head_nod),
+    }
+    for phase, count in sample_counts.items():
+        if count < min_samples:
+            warnings.append(f"Low sample count for {phase}: {count}")
+
+    confidence = _calibration_confidence(sample_counts, min_samples, warnings)
+    return {
+        "EAR_THRESHOLD": round(ear_threshold, 3),
+        "MAR_THRESHOLD": round(mar_threshold, 3),
+        "HEAD_PITCH_THRESHOLD": round(pitch_threshold, 1),
+        "baselines": {
+            "neutral_ear": round(neutral_ear, 3),
+            "open_ear_floor": round(open_ear_floor, 3),
+            "closed_ear": round(closed_ear, 3),
+            "neutral_mar": round(neutral_mar, 3),
+            "resting_mar_ceiling": round(resting_mar_ceiling, 3),
+            "yawn_mar": round(yawn_mar, 3),
+            "neutral_pitch": round(neutral_pitch, 1),
+            "neutral_pitch_ceiling": round(neutral_pitch_ceiling, 1),
+            "nod_pitch": round(nod_pitch, 1),
+        },
+        "sample_counts": sample_counts,
+        "confidence": confidence,
+        "warnings": tuple(warnings),
+    }
 
 
 def _median_attr(samples, attr, fallback):
@@ -184,3 +248,14 @@ def _high_attr(samples, attr, fallback):
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def _calibration_confidence(sample_counts, min_samples, warnings):
+    if not sample_counts:
+        return "low"
+    sample_score = min(sample_counts.values()) / max(min_samples, 1)
+    if warnings or sample_score < 0.75:
+        return "low"
+    if sample_score < 1.25:
+        return "medium"
+    return "high"
