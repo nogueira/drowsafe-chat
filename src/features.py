@@ -14,6 +14,7 @@ Soukupová & Čech (2016) "Real-Time Eye Blink Detection using Facial Landmarks"
 import numpy as np
 import cv2
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -67,7 +68,7 @@ class Features:
 
 def _euclidean(p1, p2) -> float:
     """Euclidean distance between two 2D points."""
-    return np.linalg.norm(np.array(p1) - np.array(p2))
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
 
 def _mouth_opening_ratio(landmarks, frame_w: int, frame_h: int) -> float:

@@ -57,6 +57,11 @@ BG_COLOUR     = (18,  18,  18)   # Dark background
 TEXT_PRIMARY  = (236, 240, 241)
 TEXT_SECONDARY= (149, 165, 166)
 
+CAMERA_UNAVAILABLE_TITLE = "Camera frame unavailable"
+CAMERA_UNAVAILABLE_DETAIL = "Check the camera connection"
+FACE_NOT_DETECTED_TITLE = "Face not detected"
+FACE_NOT_DETECTED_DETAIL = "Look toward the camera and improve lighting"
+
 
 class Dashboard:
     """Pygame fullscreen dashboard."""
@@ -136,10 +141,20 @@ class Dashboard:
         if frame is not None:
             self._draw_camera(frame, cam_w, cam_h)
         else:
-            self._draw_camera_message(cam_w, cam_h, "Camera frame unavailable")
+            self._draw_camera_message(
+                cam_w,
+                cam_h,
+                CAMERA_UNAVAILABLE_TITLE,
+                CAMERA_UNAVAILABLE_DETAIL,
+            )
 
         if frame is not None and features is None:
-            self._draw_camera_message(cam_w, cam_h, "No face detected")
+            self._draw_camera_message(
+                cam_w,
+                cam_h,
+                FACE_NOT_DETECTED_TITLE,
+                FACE_NOT_DETECTED_DETAIL,
+            )
 
         # --- Metrics panel ---
         metrics_x = cam_w + 10
@@ -190,10 +205,20 @@ class Dashboard:
         if frame is not None:
             self._draw_camera(frame, cam_w, cam_h)
         else:
-            self._draw_camera_message(cam_w, cam_h, "Camera frame unavailable")
+            self._draw_camera_message(
+                cam_w,
+                cam_h,
+                CAMERA_UNAVAILABLE_TITLE,
+                CAMERA_UNAVAILABLE_DETAIL,
+            )
 
         if frame is not None and features is None and not recommendation_lines:
-            self._draw_camera_message(cam_w, cam_h, "No face detected")
+            self._draw_camera_message(
+                cam_w,
+                cam_h,
+                FACE_NOT_DETECTED_TITLE,
+                FACE_NOT_DETECTED_DETAIL,
+            )
 
         metrics_x = cam_w + 10
         self._draw_calibration_metrics(metrics_x, features, recommendation_lines)
@@ -329,14 +354,14 @@ class Dashboard:
         if fill_w > 0:
             pygame.draw.rect(self._screen, (52, 152, 219), (16, bar_y, fill_w, 12), border_radius=6)
 
-    def _draw_camera_message(self, cam_w: int, cam_h: int, text: str):
+    def _draw_camera_message(self, cam_w: int, cam_h: int, text: str, detail_text: str):
         """Draw a centered status message over the camera area."""
         overlay = pygame.Surface((cam_w, cam_h), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 110))
         self._screen.blit(overlay, (0, 0))
 
         message = self._font_med.render(text, True, (255, 255, 255))
-        detail = self._font_small.render("Adjust position or lighting", True, TEXT_SECONDARY)
+        detail = self._font_small.render(detail_text, True, TEXT_SECONDARY)
 
         mx = cam_w // 2 - message.get_width() // 2
         my = cam_h // 2 - message.get_height()

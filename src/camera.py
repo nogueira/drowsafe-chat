@@ -72,40 +72,46 @@ class Picamera2Camera:
         self.height = height
         self._flip  = flip
         self._cam   = Picamera2()
+        self._native_rgb = True
 
         try:
-            config = self._cam.create_video_configuration(
-                main={"size": (width, height), "format": "BGR888"},
+            config = self._create_video_config(width, height, fps, "RGB888")
+            self._cam.configure(config)
+            pixel_format = "RGB888"
+        except Exception as e:
+            self._native_rgb = False
+            log.warning("RGB888 camera config failed (%s) — falling back to BGR888.", e)
+            config = self._create_video_config(width, height, fps, "BGR888")
+            self._cam.configure(config)
+            pixel_format = "BGR888"
+
+        self._cam.start()
+        log.info("Picamera2 started: %dx%d @ %d fps (%s)", width, height, fps, pixel_format)
+
+    def _create_video_config(self, width: int, height: int, fps: int, pixel_format: str):
+        try:
+            return self._cam.create_video_configuration(
+                main={"size": (width, height), "format": pixel_format},
                 controls={"FrameRate": fps},
                 buffer_count=CAMERA_BUFFER_COUNT,
             )
         except TypeError:
-            config = self._cam.create_video_configuration(
-                main={"size": (width, height), "format": "BGR888"},
+            return self._cam.create_video_configuration(
+                main={"size": (width, height), "format": pixel_format},
                 controls={"FrameRate": fps},
             )
-        self._cam.configure(config)
-        self._cam.start()
-        log.info("Picamera2 started: %dx%d @ %d fps", width, height, fps)
 
     def read(self):
         frame = self._cam.capture_array("main")
         if frame is None:
             return None
 
-        # Normalise to 3-channel
-        if frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        elif frame.shape[2] == 4:
-            frame = frame[:, :, :3]
-
-        # BGR888 from picamera2 — convert to RGB for the pipeline
         if frame.ndim == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         elif frame.shape[2] == 4:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-        elif frame.shape[2] == 3:
+            frame = frame[:, :, :3]
+
+        if not self._native_rgb and frame.ndim == 3 and frame.shape[2] == 3:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if self._flip:
@@ -163,6 +169,7 @@ class Camera:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             cap.set(cv2.CAP_PROP_FPS,          fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
             if cap.isOpened():
                 self._backend = _OpenCVCamera(cap, flip=flip)
                 log.info("Camera backend: OpenCV VideoCapture (index=%s)", camera_index)

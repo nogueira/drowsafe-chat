@@ -6,7 +6,6 @@ Uses lgpio (the correct GPIO library for Raspberry Pi 5 on Bookworm).
 """
 
 import threading
-import time
 import logging
 
 log = logging.getLogger("drowsafe.alert")
@@ -60,22 +59,26 @@ class AlertController:
         self._level    = ALERT
         self._running  = True
         self._lock     = threading.Lock()
+        self._wake     = threading.Event()
         self._pin_ok   = False
         self._chip     = None
-        self._thread   = threading.Thread(
-            target=self._buzzer_loop, daemon=True, name="buzzer"
-        )
+        self._thread   = None
 
         self._chip = _open_gpio_chip()
         if self._chip is not None:
             self._pin_ok = _claim_pin(self._chip, BUZZER_PIN)
 
-        self._thread.start()
+        if self._pin_ok:
+            self._thread = threading.Thread(
+                target=self._buzzer_loop, daemon=True, name="buzzer"
+            )
+            self._thread.start()
         log.info("AlertController started (buzzer=%s).", "enabled" if self._pin_ok else "disabled")
 
     def update(self, alert_level: int):
         with self._lock:
             self._level = alert_level
+        self._wake.set()
 
     def _set_buzzer(self, state: bool):
         if self._pin_ok and self._chip is not None:
@@ -91,21 +94,36 @@ class AlertController:
 
             if level == ALERT:
                 self._set_buzzer(False)
-                time.sleep(0.1)
+                self._sleep_or_wake(0.1)
             elif level == WARNING:
                 period = 1.0 / BUZZER_WARNING_HZ
-                self._set_buzzer(True);  time.sleep(period / 2)
-                self._set_buzzer(False); time.sleep(period / 2)
+                self._set_buzzer(True)
+                if self._sleep_or_wake(period / 2):
+                    continue
+                self._set_buzzer(False)
+                if self._sleep_or_wake(period / 2):
+                    continue
             elif level == CRITICAL:
                 period = 1.0 / BUZZER_CRITICAL_HZ
-                self._set_buzzer(True);  time.sleep(period / 2)
-                self._set_buzzer(False); time.sleep(period / 2)
+                self._set_buzzer(True)
+                if self._sleep_or_wake(period / 2):
+                    continue
+                self._set_buzzer(False)
+                if self._sleep_or_wake(period / 2):
+                    continue
 
         self._set_buzzer(False)
 
+    def _sleep_or_wake(self, timeout: float):
+        woke = self._wake.wait(timeout)
+        self._wake.clear()
+        return woke
+
     def stop(self):
         self._running = False
-        self._thread.join(timeout=2.0)
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
         if self._chip is not None:
             try:
                 if self._pin_ok:

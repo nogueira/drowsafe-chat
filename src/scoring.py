@@ -70,6 +70,7 @@ class FatigueScorer:
     def __init__(self):
         # PERCLOS rolling window: stores (timestamp, eye_closed) tuples
         self._eye_history: deque = deque()
+        self._eye_closed_count   = 0
 
         # Yawn counter over the same window
         self._yawn_history: deque = deque()
@@ -141,6 +142,8 @@ class FatigueScorer:
                 self._ear_high_count = 0
         eye_closed = self._ear_low_count >= EAR_CONSEC_FRAMES
         self._eye_history.append((now, eye_closed))
+        if eye_closed:
+            self._eye_closed_count += 1
 
         # --- Yawning? (sustained threshold + falling edge event) ---
         yawning = features.mar > MAR_THRESHOLD
@@ -169,7 +172,9 @@ class FatigueScorer:
         # --- Prune expired history entries ---
         cutoff = now - PERCLOS_WINDOW_SEC
         while self._eye_history and self._eye_history[0][0] < cutoff:
-            self._eye_history.popleft()
+            _, was_closed = self._eye_history.popleft()
+            if was_closed:
+                self._eye_closed_count -= 1
         while self._yawn_history and self._yawn_history[0] < cutoff:
             self._yawn_history.popleft()
         while self._nod_history and self._nod_history[0] < cutoff:
@@ -234,8 +239,7 @@ class FatigueScorer:
         """
         if not self._eye_history:
             return 0.0
-        closed = sum(1 for _, c in self._eye_history if c)
-        return closed / len(self._eye_history)
+        return self._eye_closed_count / len(self._eye_history)
 
     @property
     def perclos(self) -> float:
@@ -250,6 +254,7 @@ class FatigueScorer:
     def reset(self):
         """Clear all rolling history (e.g. driver change)."""
         self._eye_history.clear()
+        self._eye_closed_count = 0
         self._yawn_history.clear()
         self._nod_history.clear()
         self._last_score = 0.0
