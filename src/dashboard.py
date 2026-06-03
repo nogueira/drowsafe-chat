@@ -75,6 +75,8 @@ class Dashboard:
 
     TOP_BAR_H = 34
     BANNER_H = 58
+    SIDE_PANEL_W = 250
+    GAP = 14
 
     def __init__(self, width: int = 800, height: int = 480, fullscreen: bool = True):
         self._width      = width
@@ -149,7 +151,15 @@ class Dashboard:
         colour = COLOURS.get(alert_level, COLOURS[0])
         self._screen.fill(BG_COLOUR)
 
-        camera_rect = pygame.Rect(0, self.TOP_BAR_H, self._width, self._height - self.TOP_BAR_H - self.BANNER_H)
+        content_top = self.TOP_BAR_H + self.GAP
+        content_h = self._height - self.TOP_BAR_H - self.BANNER_H - (self.GAP * 2)
+        camera_rect = pygame.Rect(
+            self.GAP,
+            content_top,
+            self._width - self.SIDE_PANEL_W - (self.GAP * 3),
+            content_h,
+        )
+        panel_x = camera_rect.right + self.GAP
 
         # --- Camera feed ---
         if frame is not None:
@@ -171,9 +181,9 @@ class Dashboard:
         self._sample_score_history(score)
         self._draw_video_scrim(camera_rect)
         self._draw_status_bar(frame, features, fps, simulated, alert_level)
-        self._draw_score_gauge(score, alert_level, alert_reason)
-        self._draw_metric_chips(features, fps, perclos)
-        self._draw_score_history(colour)
+        self._draw_metric_chips(panel_x, content_top, features, fps, perclos)
+        self._draw_score_gauge(panel_x, content_top + 152, score, alert_level, alert_reason)
+        self._draw_score_history(panel_x, self._height - self.BANNER_H - self.GAP - 72, colour)
 
         # --- Alert banner (bottom) ---
         self._draw_alert_banner(alert_level, score, colour, alert_reason)
@@ -405,13 +415,13 @@ class Dashboard:
         s = self._fit_text(status, self._font_tiny, self._width - 42, TEXT_PRIMARY)
         self._screen.blit(s, (28, self.TOP_BAR_H // 2 - s.get_height() // 2))
 
-    def _draw_score_gauge(self, score: float, alert_level: int, alert_reason: str = None):
+    def _draw_score_gauge(self, x: int, y: int, score: float, alert_level: int, alert_reason: str = None):
         colour = COLOURS.get(alert_level, COLOURS[0])
-        rect = pygame.Rect(20, self._height - self.BANNER_H - 150, 176, 132)
+        rect = pygame.Rect(x, y, self.SIDE_PANEL_W, 118)
         self._draw_panel(rect)
 
-        center = (rect.x + 88, rect.y + 66)
-        radius = 46
+        center = (rect.x + 70, rect.y + 58)
+        radius = 42
         track = pygame.Rect(center[0] - radius, center[1] - radius, radius * 2, radius * 2)
         pygame.draw.arc(self._screen, (56, 64, 72), track, math.radians(145), math.radians(395), 8)
 
@@ -433,15 +443,15 @@ class Dashboard:
         self._screen.blit(label_s, (center[0] - label_s.get_width() // 2, center[1] + 18))
 
         reason = alert_reason or "Monitoring active"
-        reason_s = self._fit_text(reason, self._font_tiny, rect.width - 22, TEXT_SECONDARY)
-        self._screen.blit(reason_s, (rect.x + 11, rect.bottom - 24))
+        heading = self._font_tiny.render("FATIGUE SCORE", True, TEXT_SECONDARY)
+        reason_s = self._fit_text(reason, self._font_small, rect.width - 150, TEXT_PRIMARY)
+        self._screen.blit(heading, (rect.x + 140, rect.y + 28))
+        self._screen.blit(reason_s, (rect.x + 140, rect.y + 52))
 
-    def _draw_metric_chips(self, features, fps, perclos):
-        x = self._width - 230
-        y = self.TOP_BAR_H + 18
-        w = 210
-        h = 38
+    def _draw_metric_chips(self, x: int, y: int, features, fps, perclos):
         gap = 8
+        w = (self.SIDE_PANEL_W - gap) // 2
+        h = 42
 
         if features:
             ear_warn = self._update_eye_warning(features.ear)
@@ -450,7 +460,6 @@ class Dashboard:
                 ("MAR", f"{features.mar:.3f}", features.mar > MAR_THRESHOLD),
                 ("HEAD", f"{features.head_pitch:+.1f} deg", abs(features.head_pitch) > HEAD_PITCH_THRESHOLD),
                 ("PERCLOS", f"{(perclos or 0.0) * 100:.0f}%", (perclos or 0.0) >= PERCLOS_THRESHOLD),
-                ("FACE", "TRACKED", False),
             ]
         else:
             chips = [
@@ -458,15 +467,17 @@ class Dashboard:
                 ("MAR", "--", True),
                 ("HEAD", "--", True),
                 ("PERCLOS", f"{(perclos or 0.0) * 100:.0f}%", False),
-                ("FACE", "LOST", True),
             ]
 
+        chips.append(("FACE", "TRACKED" if features else "LOST", features is None))
         if fps is not None:
             chips.append(("FPS", f"{fps:.1f}", fps < 18.0))
 
-        for label, value, warn in chips:
-            self._draw_chip(pygame.Rect(x, y, w, h), label, value, warn)
-            y += h + gap
+        for i, (label, value, warn) in enumerate(chips):
+            col = i % 2
+            row = i // 2
+            rect = pygame.Rect(x + col * (w + gap), y + row * (h + gap), w, h)
+            self._draw_chip(rect, label, value, warn)
 
     def _update_eye_warning(self, ear: float) -> bool:
         if ear < EAR_THRESHOLD:
@@ -487,17 +498,17 @@ class Dashboard:
         pygame.draw.rect(self._screen, colour, (rect.x, rect.y, 4, rect.height), border_radius=2)
 
         label_s = self._font_tiny.render(label, True, TEXT_SECONDARY)
-        value_s = self._fit_text(value, self._font_small, rect.width - 82, TEXT_PRIMARY)
-        self._screen.blit(label_s, (rect.x + 14, rect.y + 6))
-        self._screen.blit(value_s, (rect.right - value_s.get_width() - 12, rect.y + 9))
+        value_s = self._fit_text(value, self._font_small, rect.width - 22, TEXT_PRIMARY)
+        self._screen.blit(label_s, (rect.x + 12, rect.y + 5))
+        self._screen.blit(value_s, (rect.right - value_s.get_width() - 10, rect.y + 19))
 
-    def _draw_score_history(self, colour):
-        rect = pygame.Rect(214, self._height - self.BANNER_H - 80, 260, 62)
+    def _draw_score_history(self, x: int, y: int, colour):
+        rect = pygame.Rect(x, y, self.SIDE_PANEL_W, 72)
         self._draw_panel(rect, alpha=190)
         title = self._font_tiny.render("60 SEC RISK TREND", True, TEXT_SECONDARY)
         self._screen.blit(title, (rect.x + 12, rect.y + 8))
 
-        plot = pygame.Rect(rect.x + 12, rect.y + 28, rect.width - 24, 24)
+        plot = pygame.Rect(rect.x + 12, rect.y + 30, rect.width - 24, 30)
         pygame.draw.line(self._screen, (58, 66, 74), (plot.x, plot.centery), (plot.right, plot.centery), 1)
         values = list(self._score_history)
         if len(values) < 2:
