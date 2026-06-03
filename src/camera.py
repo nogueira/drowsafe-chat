@@ -115,7 +115,7 @@ class Picamera2Camera:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if self._flip:
-            frame = cv2.flip(frame, -1)
+            frame = cv2.flip(frame, 0)
         return frame
 
     def release(self):
@@ -221,7 +221,7 @@ class _OpenCVCamera:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if self._flip:
-            frame = cv2.flip(frame, -1)
+            frame = cv2.flip(frame, 0)
         return frame
 
     def release(self):

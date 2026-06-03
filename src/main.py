@@ -217,7 +217,7 @@ def main():
     )
     parser.add_argument(
         "--no-flip", action="store_true",
-        help="Disable 180-degree camera flip from config"
+        help="Disable vertical camera flip from config"
     )
     parser.add_argument(
         "--guided-calibration", action="store_true",
