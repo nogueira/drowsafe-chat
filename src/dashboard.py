@@ -179,7 +179,6 @@ class Dashboard:
             )
 
         self._sample_score_history(score)
-        self._draw_video_scrim(camera_rect)
         self._draw_status_bar(frame, features, fps, simulated, alert_level)
         self._draw_metric_chips(panel_x, content_top, features, fps, perclos)
         self._draw_score_gauge(panel_x, content_top + 152, score, alert_level, alert_reason)
@@ -390,14 +389,6 @@ class Dashboard:
         if not self._score_history or now - self._last_history_sample >= 0.5:
             self._score_history.append(max(0.0, min(100.0, score)))
             self._last_history_sample = now
-
-    def _draw_video_scrim(self, rect):
-        top = pygame.Surface((rect.width, 96), pygame.SRCALPHA)
-        top.fill((0, 0, 0, 80))
-        self._screen.blit(top, rect.topleft)
-        bottom = pygame.Surface((rect.width, 122), pygame.SRCALPHA)
-        bottom.fill((0, 0, 0, 105))
-        self._screen.blit(bottom, (rect.x, rect.bottom - bottom.get_height()))
 
     def _draw_status_bar(self, frame, features, fps, simulated: bool, alert_level: int):
         pygame.draw.rect(self._screen, BG_COLOUR, (0, 0, self._width, self.TOP_BAR_H))
