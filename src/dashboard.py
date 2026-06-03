@@ -1,0 +1,456 @@
+"""
+DrowSAFE — Dashboard UI.
+
+Pygame-based fullscreen dashboard for the Raspberry Pi Touch Display v1.1.
+Shows live camera feed, fatigue score, alert level, and key metrics.
+
+Layout (800×480)
+----------------
+  ┌──────────────────────────────────────────┐
+  │  CAMERA FEED (left 60%)   │  METRICS     │
+  │                           │  (right 40%) │
+  │                           │  Score gauge │
+  │                           │  EAR / MAR   │
+  │                           │  Head pose   │
+  │                           │  PERCLOS     │
+  │  ALERT BANNER (bottom)                   │
+  └──────────────────────────────────────────┘
+"""
+
+import sys
+import logging
+import numpy as np
+import time
+
+log = logging.getLogger("drowsafe.dashboard")
+
+try:
+    from config.config import EAR_THRESHOLD, EAR_CONSEC_FRAMES, EAR_RECOVERY_FRAMES, MAR_THRESHOLD, HEAD_PITCH_THRESHOLD
+except ImportError:
+    EAR_THRESHOLD        = 0.22
+    EAR_CONSEC_FRAMES    = 20
+    EAR_RECOVERY_FRAMES  = 3
+    MAR_THRESHOLD        = 0.45
+    HEAD_PITCH_THRESHOLD = 20
+
+try:
+    import pygame
+    _PYGAME_AVAILABLE = True
+except ImportError:
+    _PYGAME_AVAILABLE = False
+    log.warning("Pygame not available — dashboard disabled.")
+
+# Alert level colours (RGB)
+COLOURS = {
+    0: (39,  174,  96),   # Green  — ALERT
+    1: (243, 156,  18),   # Amber  — WARNING
+    2: (231,  76,  60),   # Red    — CRITICAL
+}
+
+LABEL_COLOURS = {
+    0: "ALERT",
+    1: "WARNING ⚠",
+    2: "CRITICAL ⛔",
+}
+
+BG_COLOUR     = (18,  18,  18)   # Dark background
+TEXT_PRIMARY  = (236, 240, 241)
+TEXT_SECONDARY= (149, 165, 166)
+
+
+class Dashboard:
+    """Pygame fullscreen dashboard."""
+
+    CAM_W_RATIO = 0.60   # Camera feed takes 60% of display width
+
+    def __init__(self, width: int = 800, height: int = 480, fullscreen: bool = True):
+        self._width      = width
+        self._height     = height
+        self._running    = _PYGAME_AVAILABLE
+        self._screen     = None
+        self._clock      = None
+        self._font_large = None
+        self._font_med   = None
+        self._font_small = None
+
+        if not _PYGAME_AVAILABLE:
+            return
+
+        pygame.init()
+        flags = pygame.FULLSCREEN | pygame.NOFRAME if fullscreen else 0
+        self._screen = pygame.display.set_mode((width, height), flags)
+        pygame.display.set_caption("DrowSAFE")
+        self._clock = pygame.time.Clock()
+
+        # Fonts — uses system DejaVu Sans (installed via apt)
+        self._font_large = pygame.font.SysFont("dejavusans", 52, bold=True)
+        self._font_med   = pygame.font.SysFont("dejavusans", 28)
+        self._font_small = pygame.font.SysFont("dejavusans", 20)
+
+        self._ear_low_frames  = 0   # consecutive frames EAR below threshold
+        self._ear_high_frames = 0   # consecutive frames EAR above threshold (grace period)
+
+        log.info("Dashboard initialised (%dx%d, fullscreen=%s)", width, height, fullscreen)
+
+    def render(
+        self,
+        frame,
+        score: float,
+        alert_level: int,
+        features,
+        fps: float = None,
+        simulated: bool = False,
+        alert_reason: str = None,
+    ):
+        """
+        Render one dashboard frame.
+
+        Parameters
+        ----------
+        frame       : numpy.ndarray (RGB) | None
+        score       : float  — fatigue score 0–100
+        alert_level : int    — 0 / 1 / 2
+        features    : Features | None
+        fps         : float | None
+        simulated   : bool   — show simulation badge if True
+        """
+        if not _PYGAME_AVAILABLE or self._screen is None:
+            return
+
+        # Handle quit events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self._running = False
+                return
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self._running = False
+                return
+
+        colour = COLOURS[alert_level]
+        self._screen.fill(BG_COLOUR)
+
+        cam_w = int(self._width * self.CAM_W_RATIO)
+        cam_h = self._height - 60   # Leave space for alert banner
+
+        # --- Camera feed ---
+        if frame is not None:
+            self._draw_camera(frame, cam_w, cam_h)
+        else:
+            self._draw_camera_message(cam_w, cam_h, "Camera frame unavailable")
+
+        if frame is not None and features is None:
+            self._draw_camera_message(cam_w, cam_h, "No face detected")
+
+        # --- Metrics panel ---
+        metrics_x = cam_w + 10
+        self._draw_metrics(metrics_x, score, alert_level, features, colour)
+
+        # --- Alert banner (bottom) ---
+        self._draw_alert_banner(alert_level, score, colour, alert_reason)
+
+        # --- FPS ---
+        if fps is not None:
+            fps_surf = self._font_small.render(f"{fps:.1f} fps", True, TEXT_SECONDARY)
+            self._screen.blit(fps_surf, (8, 8))
+
+        # --- Simulation badge ---
+        if simulated:
+            sim_surf = self._font_small.render("⚙ SIMULATION", True, (80, 80, 220))
+            self._screen.blit(sim_surf, (self._width - sim_surf.get_width() - 8, 8))
+
+        pygame.display.flip()
+        self._clock.tick(60)
+
+    def render_calibration(
+        self,
+        frame,
+        features,
+        step_title: str,
+        instruction: str,
+        progress: float,
+        recommendation_lines=None,
+        fps: float = None,
+    ):
+        """Render the guided calibration screen."""
+        if not _PYGAME_AVAILABLE or self._screen is None:
+            return
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self._running = False
+                return
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self._running = False
+                return
+
+        self._screen.fill(BG_COLOUR)
+        cam_w = int(self._width * self.CAM_W_RATIO)
+        cam_h = self._height - 60
+
+        if frame is not None:
+            self._draw_camera(frame, cam_w, cam_h)
+        else:
+            self._draw_camera_message(cam_w, cam_h, "Camera frame unavailable")
+
+        if frame is not None and features is None and not recommendation_lines:
+            self._draw_camera_message(cam_w, cam_h, "No face detected")
+
+        metrics_x = cam_w + 10
+        self._draw_calibration_metrics(metrics_x, features, recommendation_lines)
+        self._draw_calibration_overlay(cam_w, cam_h, step_title, instruction, progress, recommendation_lines)
+
+        if fps is not None:
+            fps_surf = self._font_small.render(f"{fps:.1f} fps", True, TEXT_SECONDARY)
+            self._screen.blit(fps_surf, (8, 8))
+
+        pygame.draw.rect(self._screen, (52, 152, 219), pygame.Rect(0, self._height - 54, self._width, 54))
+        text = "Guided calibration — press ESC to exit"
+        s = self._fit_text(text, self._font_med, self._width - 24, (255, 255, 255))
+        self._screen.blit(s, (self._width // 2 - s.get_width() // 2, self._height - 37))
+
+        pygame.display.flip()
+        self._clock.tick(60)
+
+    def render_startup(self, checks, duration_sec: float = 2.5):
+        """Show startup self-test results briefly."""
+        if not _PYGAME_AVAILABLE or self._screen is None:
+            return
+
+        started = time.monotonic()
+        while self._running and time.monotonic() - started < duration_sec:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self._running = False
+                    return
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    self._running = False
+                    return
+
+            self._screen.fill(BG_COLOUR)
+            title = self._font_med.render("Startup self-test", True, TEXT_PRIMARY)
+            self._screen.blit(title, (28, 28))
+
+            y = 82
+            for check in checks:
+                colour = (39, 174, 96) if check.ok else (243, 156, 18)
+                status = "OK" if check.ok else "WARN"
+                line = f"{status}  {check.name}: {check.detail}"
+                s = self._fit_text(line, self._font_small, self._width - 56, colour)
+                self._screen.blit(s, (28, y))
+                y += 30
+
+            pygame.display.flip()
+            self._clock.tick(30)
+
+    def _draw_camera(self, frame, cam_w: int, cam_h: int):
+        """Scale and blit the camera frame to the left panel."""
+        import cv2
+
+        # Normalise to 3-channel
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        elif frame.shape[2] == 4:
+            frame = frame[:, :, :3]
+
+        # Scale to fit panel
+        h, w  = frame.shape[:2]
+        scale = min(cam_w / w, cam_h / h)
+        nw, nh = int(w * scale), int(h * scale)
+        frame = cv2.resize(frame, (nw, nh))
+
+        # Convert to pygame Surface using numpy transpose (proven reliable method)
+        # frame is RGB, transpose to (width, height, 3) for surfarray
+        surface = pygame.surfarray.make_surface(
+            np.ascontiguousarray(np.transpose(frame, (1, 0, 2)))
+        )
+
+        # Centre in panel
+        ox = (cam_w - nw) // 2
+        oy = (cam_h - nh) // 2
+        self._screen.blit(surface, (ox, oy))
+
+    def _draw_calibration_metrics(self, x: int, features, recommendation_lines):
+        panel_w = self._width - x - 10
+        y = 24
+
+        title = self._font_small.render("CALIBRATION", True, TEXT_SECONDARY)
+        self._screen.blit(title, (x, y))
+        y += 34
+
+        def row(label, value):
+            nonlocal y
+            self._screen.blit(self._font_small.render(label, True, TEXT_SECONDARY), (x, y))
+            self._screen.blit(self._font_small.render(value, True, TEXT_PRIMARY), (x + 126, y))
+            y += 28
+
+        if features:
+            row("EAR", f"{features.ear:.3f}")
+            row("MAR", f"{features.mar:.3f}")
+            row("Head pitch", f"{features.head_pitch:+.1f}°")
+        else:
+            row("EAR", "—")
+            row("MAR", "—")
+            row("Head pitch", "—")
+
+        if recommendation_lines:
+            y += 18
+            for line in recommendation_lines[1:]:
+                s = self._fit_text(line, self._font_small, panel_w, TEXT_PRIMARY)
+                self._screen.blit(s, (x, y))
+                y += 28
+
+    def _draw_calibration_overlay(
+        self,
+        cam_w: int,
+        cam_h: int,
+        step_title: str,
+        instruction: str,
+        progress: float,
+        recommendation_lines,
+    ):
+        overlay_h = 116 if not recommendation_lines else 150
+        overlay = pygame.Surface((cam_w, overlay_h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 175))
+        oy = cam_h - overlay_h - 12
+        self._screen.blit(overlay, (0, oy))
+
+        title = recommendation_lines[0] if recommendation_lines else step_title
+        title_s = self._fit_text(title, self._font_med, cam_w - 32, (255, 255, 255))
+        self._screen.blit(title_s, (16, oy + 14))
+
+        body = "Review the recommended thresholds in the side panel." if recommendation_lines else instruction
+        body_s = self._fit_text(body, self._font_small, cam_w - 32, TEXT_PRIMARY)
+        self._screen.blit(body_s, (16, oy + 54))
+
+        bar_w = cam_w - 32
+        bar_y = oy + overlay_h - 30
+        pygame.draw.rect(self._screen, (70, 70, 70), (16, bar_y, bar_w, 12), border_radius=6)
+        fill_w = int(bar_w * max(0.0, min(1.0, progress)))
+        if fill_w > 0:
+            pygame.draw.rect(self._screen, (52, 152, 219), (16, bar_y, fill_w, 12), border_radius=6)
+
+    def _draw_camera_message(self, cam_w: int, cam_h: int, text: str):
+        """Draw a centered status message over the camera area."""
+        overlay = pygame.Surface((cam_w, cam_h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 110))
+        self._screen.blit(overlay, (0, 0))
+
+        message = self._font_med.render(text, True, (255, 255, 255))
+        detail = self._font_small.render("Adjust position or lighting", True, TEXT_SECONDARY)
+
+        mx = cam_w // 2 - message.get_width() // 2
+        my = cam_h // 2 - message.get_height()
+        dx = cam_w // 2 - detail.get_width() // 2
+        dy = my + message.get_height() + 8
+
+        self._screen.blit(message, (mx, my))
+        self._screen.blit(detail, (dx, dy))
+
+    def _draw_metrics(self, x: int, score: float, alert_level: int, features, colour):
+        """Draw the right-side metrics panel."""
+        panel_w = self._width - x - 10
+        y = 20
+
+        # Score heading
+        s = self._font_small.render("FATIGUE SCORE", True, TEXT_SECONDARY)
+        self._screen.blit(s, (x, y)); y += 24
+
+        # Score value — large, coloured
+        s = self._font_large.render(f"{int(score)}", True, colour)
+        self._screen.blit(s, (x, y)); y += 64
+
+        # Score bar
+        bar_h = 14
+        pygame.draw.rect(self._screen, (50, 50, 50), (x, y, panel_w, bar_h), border_radius=7)
+        fill_w = int(panel_w * score / 100)
+        if fill_w > 0:
+            pygame.draw.rect(self._screen, colour, (x, y, fill_w, bar_h), border_radius=7)
+        y += bar_h + 20
+
+        # Feature rows
+        def metric_row(label, value_str, warn=False):
+            nonlocal y
+            lc = (231, 76, 60) if warn else TEXT_SECONDARY
+            vc = (231, 76, 60) if warn else TEXT_PRIMARY
+            self._screen.blit(self._font_small.render(label, True, lc), (x, y))
+            self._screen.blit(self._font_small.render(value_str, True, vc), (x + 110, y))
+            y += 26
+
+        if features:
+            # EAR blink filter:
+            # - Low counter increments while EAR below threshold
+            # - Low counter resets only after EAR_RECOVERY_FRAMES consecutive
+            #   frames above threshold (avoids mid-blink noise resetting it)
+            # - Warning only fires after EAR_CONSEC_FRAMES sustained low frames
+            # - A normal blink (~12 frames) resets cleanly after 3 recovery frames
+            # - Drowsy closure (20+ frames) triggers the warning
+            if features.ear < EAR_THRESHOLD:
+                self._ear_low_frames  += 1
+                self._ear_high_frames  = 0
+            else:
+                self._ear_high_frames += 1
+                if self._ear_high_frames >= EAR_RECOVERY_FRAMES:
+                    self._ear_low_frames  = 0
+                    self._ear_high_frames = 0
+            ear_sustained = self._ear_low_frames >= EAR_CONSEC_FRAMES
+
+            metric_row("EAR",       f"{features.ear:.3f}",
+                       warn=ear_sustained)
+            metric_row("MAR",       f"{features.mar:.3f}",
+                       warn=features.mar > MAR_THRESHOLD)
+            metric_row("Head pitch",f"{features.head_pitch:+.1f}°",
+                       warn=abs(features.head_pitch) > HEAD_PITCH_THRESHOLD)
+        else:
+            metric_row("EAR",       "—")
+            metric_row("MAR",       "—")
+            metric_row("Head pitch","—")
+
+        y += 6
+        # Alert level badge
+        badge_col = colour
+        badge_rect = pygame.Rect(x, y, panel_w, 34)
+        pygame.draw.rect(self._screen, badge_col, badge_rect, border_radius=8)
+        label = LABEL_COLOURS[alert_level]
+        ls    = self._font_small.render(label, True, (255, 255, 255))
+        lx    = badge_rect.centerx - ls.get_width() // 2
+        ly    = badge_rect.centery - ls.get_height() // 2
+        self._screen.blit(ls, (lx, ly))
+
+    def _fit_text(self, text: str, font, max_width: int, colour):
+        """Render text, shortening the middle if it would overflow."""
+        if font.size(text)[0] <= max_width:
+            return font.render(text, True, colour)
+
+        ellipsis = "..."
+        while text and font.size(text + ellipsis)[0] > max_width:
+            text = text[:-1]
+        return font.render((text + ellipsis) if text else ellipsis, True, colour)
+
+    def _draw_alert_banner(self, alert_level: int, score: float, colour, alert_reason: str = None):
+        """Draw the bottom alert banner."""
+        bh      = 54
+        by      = self._height - bh
+        banner  = pygame.Rect(0, by, self._width, bh)
+        pygame.draw.rect(self._screen, colour, banner)
+
+        if alert_level == 0:
+            text = "Driver monitoring active — stay alert"
+        elif alert_level == 1:
+            reason = f": {alert_reason}" if alert_reason else ""
+            text = f"⚠  Drowsiness detected{reason} — please take a break"
+        else:
+            reason = f": {alert_reason}" if alert_reason else ""
+            text = f"⛔  WAKE UP{reason} — Pull over immediately!"
+
+        s  = self._fit_text(text, self._font_med, self._width - 24, (255, 255, 255))
+        sx = self._width  // 2 - s.get_width()  // 2
+        sy = by + bh // 2 - s.get_height() // 2
+        self._screen.blit(s, (sx, sy))
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def quit(self):
+        if _PYGAME_AVAILABLE:
+            pygame.quit()
+        log.info("Dashboard closed.")

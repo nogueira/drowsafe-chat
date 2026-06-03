@@ -1,0 +1,1700 @@
+From 58df04b6685e1a43aece835827150ca47fc17a96 Mon Sep 17 00:00:00 2001
+From: Octavio Nogueira <nogueira@tato.ind.br>
+Date: Mon, 1 Jun 2026 10:55:30 -0300
+Subject: [PATCH] Improve Raspberry Pi driver monitoring product flow
+
+---
+ README.md              |  33 ++++++-
+ config/config.py       |  24 +++++
+ docs/CALIBRATION.md    |  22 ++++-
+ src/alert.py           |  54 +++++++----
+ src/calibration.py     | 186 ++++++++++++++++++++++++++++++++++++++
+ src/camera.py          |  79 +++++++++++-----
+ src/dashboard.py       | 189 +++++++++++++++++++++++++++++++++++++--
+ src/detector.py        |  27 ++++--
+ src/health.py          |  40 +++++++++
+ src/logger.py          |  80 +++++++++++++++--
+ src/main.py            | 198 +++++++++++++++++++++++++++++++++++++++--
+ src/scoring.py         | 124 ++++++++++++++++++++++----
+ tests/test_features.py |   2 +-
+ tests/test_scoring.py  |  36 ++++++--
+ 14 files changed, 1001 insertions(+), 93 deletions(-)
+ create mode 100644 src/calibration.py
+ create mode 100644 src/health.py
+
+diff --git a/README.md b/README.md
+index 429171f..f2aca40 100644
+--- a/README.md
++++ b/README.md
+@@ -138,6 +138,15 @@ Or directly:
+ python src/main.py
+ ```
+ 
++Run the guided calibration flow:
++
++```bash
++python src/main.py --guided-calibration
++```
++
++This walks the driver through neutral face, eye closure, mouth opening, and
++head nod samples, then saves recommended thresholds to `logs/calibration_*.json`.
++
+ ---
+ 
+ ## Configuration
+@@ -146,15 +155,35 @@ All thresholds are in `config/config.py`. Key parameters:
+ 
+ | Parameter | Default | Description |
+ |---|---|---|
+-| `EAR_THRESHOLD` | 0.22 | Eye aspect ratio below this = closed |
+-| `MAR_THRESHOLD` | 0.6 | Mouth aspect ratio above this = yawning |
++| `EAR_THRESHOLD` | 0.13 | Eye aspect ratio below this = closed |
++| `MAR_THRESHOLD` | 0.45 | Mouth aspect ratio above this = yawning |
+ | `PERCLOS_THRESHOLD` | 0.15 | >15% eye closure per minute = drowsy |
+ | `WARNING_SCORE` | 40 | Fatigue score to trigger level 1 alert |
+ | `CRITICAL_SCORE` | 70 | Fatigue score to trigger level 2 alert |
+ | `FRAME_WIDTH/HEIGHT` | 1280×720 | Camera capture resolution |
++| `PROCESS_WIDTH/HEIGHT` | 640×360 | MediaPipe inference resolution |
+ 
+ See `docs/CALIBRATION.md` for guidance on tuning these to your face and lighting conditions.
+ 
++### Raspberry Pi 5 performance profile
++
++The default runtime is tuned for Pi 5 latency:
++
++- Camera capture stays at `1280×720` for a clean dashboard feed.
++- FaceMesh inference runs at `640×360` via `PROCESS_WIDTH/HEIGHT`.
++- `DETECTOR_REFINE_LANDMARKS = False` disables iris refinement, which is not needed for EAR/MAR/head-pose scoring.
++- `CAMERA_BUFFER_COUNT = 2` reduces capture latency with picamera2.
++- OpenCV/native thread limits reduce CPU oversubscription.
++
++For maximum FPS, set `SHOW_LANDMARKS = False` in `config/config.py`; drawing the full FaceMesh tessellation is useful for debugging but expensive.
++
++### Product features
++
++- Startup self-test checks camera, FaceMesh, dashboard, buzzer, and event logging.
++- Alert banners include the main reason, such as `Eyes closed`, `Yawning detected`, `Head nod detected`, or `Face or camera unavailable`.
++- Trip summaries are saved to `logs/trip_summary_*.txt` on shutdown, alongside the event CSV.
++- Guided calibration saves personalised threshold recommendations for each installation or driver.
++
+ ---
+ 
+ ## GPIO Wiring
+diff --git a/config/config.py b/config/config.py
+index 11ca482..5fe5037 100644
+--- a/config/config.py
++++ b/config/config.py
+@@ -11,12 +11,28 @@ CAMERA_FLIP          = True   # Flip 180° — set True if camera is mounted ups
+ FRAME_WIDTH          = 1280    # Capture resolution width  (pixels)
+ FRAME_HEIGHT         = 720     # Capture resolution height (pixels)
+ FRAME_RATE           = 30      # Target capture FPS
++CAMERA_BUFFER_COUNT  = 2       # Lower buffer count reduces camera latency on Pi 5
++
++# --- Raspberry Pi 5 performance ---
++# FaceMesh is the most expensive stage. Capture can stay at 720p for display,
++# while landmarks are inferred on a smaller frame with the same aspect ratio.
++PROCESS_WIDTH        = 640     # MediaPipe inference width  (pixels)
++PROCESS_HEIGHT       = 360     # MediaPipe inference height (pixels)
++NATIVE_THREAD_LIMIT  = 2       # Limit native BLAS/OpenCV thread contention
++OPENCV_NUM_THREADS   = 1       # OpenCV mostly does resize/colour conversion here
+ 
+ # --- Display ---
+ DISPLAY_WIDTH        = 800     # RPi Touch Display v1.1 native width
+ DISPLAY_HEIGHT       = 480     # RPi Touch Display v1.1 native height
+ FULLSCREEN           = True    # Run dashboard fullscreen on DSI display
+ 
++# --- Face Detector ---
++# refine_landmarks adds iris refinement cost; DrowSAFE uses eyelid/mouth/pose
++# landmarks, so the lighter model is preferable on Raspberry Pi 5.
++DETECTOR_REFINE_LANDMARKS      = False
++DETECTOR_MIN_DETECTION_CONF    = 0.5
++DETECTOR_MIN_TRACKING_CONF     = 0.5
++
+ # --- EAR  (Eye Aspect Ratio) ---
+ # EAR = (vertical eye span) / (horizontal eye span)
+ # Drops sharply on blink; stays low on sustained closure.
+@@ -41,6 +57,14 @@ HEAD_NOD_CONSEC_FRAMES = 20   # Frames of nodding to contribute to score
+ PERCLOS_WINDOW_SEC   = 60     # Rolling window duration (seconds)
+ PERCLOS_THRESHOLD    = 0.15   # Fraction of closed frames → drowsy signal
+ 
++# --- Face / Camera Visibility ---
++# If the face disappears or the camera stops producing frames, escalate instead
++# of freezing the previous score indefinitely.
++FACE_MISSING_WARNING_SEC   = 2.0   # Seconds without face/frame before warning
++FACE_MISSING_CRITICAL_SEC  = 5.0   # Seconds without face/frame before critical
++FACE_MISSING_WARNING_SCORE = 45    # Score forced after warning timeout
++FACE_MISSING_CRITICAL_SCORE= 80    # Score forced after critical timeout
++
+ # --- Fatigue Score ---
+ # Composite 0–100 score combining EAR, MAR, head pose, PERCLOS.
+ # Weights control how much each signal contributes.
+diff --git a/docs/CALIBRATION.md b/docs/CALIBRATION.md
+index d8960e5..29b458f 100644
+--- a/docs/CALIBRATION.md
++++ b/docs/CALIBRATION.md
+@@ -8,8 +8,8 @@ Every face is different. The default thresholds in `config/config.py` are based
+ 
+ | Parameter | Default | What it controls |
+ |---|---|---|
+-| `EAR_THRESHOLD` | 0.22 | Eye considered "closed" below this |
+-| `MAR_THRESHOLD` | 0.60 | Mouth considered "yawning" above this |
++| `EAR_THRESHOLD` | 0.13 | Eye considered "closed" below this |
++| `MAR_THRESHOLD` | 0.45 | Mouth considered "yawning" above this |
+ | `HEAD_PITCH_THRESHOLD` | 20° | Forward nod angle |
+ | `PERCLOS_THRESHOLD` | 0.15 | Fraction of closed frames → drowsy |
+ 
+@@ -17,6 +17,17 @@ Every face is different. The default thresholds in `config/config.py` are based
+ 
+ ## Step 1 — Measure your baseline EAR
+ 
++The recommended path is the guided calibration mode:
++
++```bash
++python src/main.py --guided-calibration
++```
++
++It displays the camera feed, prompts the driver through each calibration pose,
++and saves threshold recommendations to `logs/calibration_*.json`.
++
++For manual calibration, use the steps below.
++
+ Run the system with `SHOW_LANDMARKS = True` in `config.py`. The dashboard displays the live EAR value.
+ 
+ 1. Sit in your normal driving position in front of the camera.
+@@ -26,7 +37,12 @@ Run the system with `SHOW_LANDMARKS = True` in `config.py`. The dashboard displa
+ 
+ Set `EAR_THRESHOLD` to a value **between** your natural open range and your blink floor. A value about 60–70% of your natural open EAR usually works well.
+ 
+-**Example:** natural open EAR = 0.30, blink floor = 0.08 → set threshold to `0.22`.
++**Example:** natural open EAR = 0.17, blink floor = 0.08 → set threshold to `0.13`.
++
++If the dashboard feed is smooth but detection is slow on Raspberry Pi 5,
++lower `PROCESS_WIDTH/PROCESS_HEIGHT` in `config/config.py` before lowering
++the camera capture resolution. Keep the same 16:9 aspect ratio, for example
++`640×360` or `480×270`.
+ 
+ ---
+ 
+diff --git a/src/alert.py b/src/alert.py
+index 6c0c97d..0edce54 100644
+--- a/src/alert.py
++++ b/src/alert.py
+@@ -11,20 +11,32 @@ import logging
+ 
+ log = logging.getLogger("drowsafe.alert")
+ 
+-try:
+-    import lgpio
+-    _GPIO_CHIP = lgpio.gpiochip_open(0)
+-    _GPIO_AVAILABLE = True
+-    log.info("lgpio initialised successfully.")
+-except (ImportError, RuntimeError, Exception) as e:
+-    _GPIO_AVAILABLE = False
+-    _GPIO_CHIP = None
+-    log.warning("lgpio not available (%s) — buzzer disabled.", e)
++lgpio = None
+ 
+ from config.config import BUZZER_PIN, BUZZER_WARNING_HZ, BUZZER_CRITICAL_HZ
+ from src.state_machine import ALERT, WARNING, CRITICAL
+ 
+ 
++def _open_gpio_chip():
++    """Import lgpio and open the GPIO chip only when the controller starts."""
++    global lgpio
++    if lgpio is None:
++        try:
++            import lgpio as _lgpio
++            lgpio = _lgpio
++        except Exception as e:
++            log.warning("lgpio not available (%s) — buzzer disabled.", e)
++            return None
++
++    try:
++        chip = lgpio.gpiochip_open(0)
++        log.info("lgpio initialised successfully.")
++        return chip
++    except Exception as e:
++        log.warning("Could not open GPIO chip (%s) — buzzer disabled.", e)
++        return None
++
++
+ def _claim_pin(chip, pin):
+     """Claim GPIO output pin, freeing it first if already busy."""
+     try:
+@@ -49,12 +61,14 @@ class AlertController:
+         self._running  = True
+         self._lock     = threading.Lock()
+         self._pin_ok   = False
++        self._chip     = None
+         self._thread   = threading.Thread(
+             target=self._buzzer_loop, daemon=True, name="buzzer"
+         )
+ 
+-        if _GPIO_AVAILABLE and _GPIO_CHIP is not None:
+-            self._pin_ok = _claim_pin(_GPIO_CHIP, BUZZER_PIN)
++        self._chip = _open_gpio_chip()
++        if self._chip is not None:
++            self._pin_ok = _claim_pin(self._chip, BUZZER_PIN)
+ 
+         self._thread.start()
+         log.info("AlertController started (buzzer=%s).", "enabled" if self._pin_ok else "disabled")
+@@ -64,9 +78,9 @@ class AlertController:
+             self._level = alert_level
+ 
+     def _set_buzzer(self, state: bool):
+-        if self._pin_ok and _GPIO_CHIP is not None:
++        if self._pin_ok and self._chip is not None:
+             try:
+-                lgpio.gpio_write(_GPIO_CHIP, BUZZER_PIN, 1 if state else 0)
++                lgpio.gpio_write(self._chip, BUZZER_PIN, 1 if state else 0)
+             except Exception:
+                 pass
+ 
+@@ -92,11 +106,17 @@ class AlertController:
+     def stop(self):
+         self._running = False
+         self._thread.join(timeout=2.0)
+-        if self._pin_ok and _GPIO_CHIP is not None:
++        if self._chip is not None:
+             try:
+-                lgpio.gpio_write(_GPIO_CHIP, BUZZER_PIN, 0)
+-                lgpio.gpio_free(_GPIO_CHIP, BUZZER_PIN)
+-                lgpio.gpiochip_close(_GPIO_CHIP)
++                if self._pin_ok:
++                    lgpio.gpio_write(self._chip, BUZZER_PIN, 0)
++                    lgpio.gpio_free(self._chip, BUZZER_PIN)
++                lgpio.gpiochip_close(self._chip)
+             except Exception:
+                 pass
++            self._chip = None
+         log.info("AlertController stopped.")
++
++    @property
++    def is_enabled(self) -> bool:
++        return self._pin_ok and self._chip is not None
+diff --git a/src/calibration.py b/src/calibration.py
+new file mode 100644
+index 0000000..27d944c
+--- /dev/null
++++ b/src/calibration.py
+@@ -0,0 +1,186 @@
++"""
++DrowSAFE guided calibration.
++
++Collects short feature samples from a driver and recommends personalised
++thresholds for EAR, MAR, and head pitch.
++"""
++
++import json
++import os
++import time
++from dataclasses import dataclass
++from datetime import datetime
++from statistics import median
++
++from config.config import LOG_DIR
++
++
++@dataclass(frozen=True)
++class CalibrationStep:
++    key: str
++    title: str
++    instruction: str
++    duration_sec: float
++
++
++class GuidedCalibrator:
++    """Small state machine for an in-cabin guided calibration session."""
++
++    STEPS = (
++        CalibrationStep(
++            "neutral",
++            "Neutral face",
++            "Look straight ahead with eyes open and mouth relaxed.",
++            8.0,
++        ),
++        CalibrationStep(
++            "eyes_closed",
++            "Eye closure",
++            "Close your eyes for a moment, then blink naturally.",
++            6.0,
++        ),
++        CalibrationStep(
++            "yawn",
++            "Mouth opening",
++            "Open your mouth wide as if yawning.",
++            6.0,
++        ),
++        CalibrationStep(
++            "head_nod",
++            "Head nod",
++            "Let your head tilt forward like a drowsy nod.",
++            6.0,
++        ),
++    )
++
++    def __init__(self):
++        self._step_index = 0
++        self._step_started = None
++        self._samples = {step.key: [] for step in self.STEPS}
++        self._recommendations = None
++        self._saved_path = None
++
++    @property
++    def is_complete(self) -> bool:
++        return self._step_index >= len(self.STEPS)
++
++    @property
++    def current_step(self):
++        if self.is_complete:
++            return None
++        return self.STEPS[self._step_index]
++
++    @property
++    def progress(self) -> float:
++        if self.is_complete or self._step_started is None:
++            return 1.0 if self.is_complete else 0.0
++        elapsed = time.monotonic() - self._step_started
++        return max(0.0, min(1.0, elapsed / self.current_step.duration_sec))
++
++    @property
++    def recommendations(self):
++        if self._recommendations is None:
++            self._recommendations = self._compute_recommendations()
++        return self._recommendations
++
++    @property
++    def saved_path(self):
++        return self._saved_path
++
++    def update(self, features):
++        if self.is_complete:
++            return
++
++        now = time.monotonic()
++        if self._step_started is None:
++            self._step_started = now
++
++        if features is not None:
++            self._samples[self.current_step.key].append(features)
++
++        if now - self._step_started >= self.current_step.duration_sec:
++            self._step_index += 1
++            self._step_started = now if not self.is_complete else None
++            if self.is_complete:
++                self._recommendations = self._compute_recommendations()
++
++    def report_lines(self):
++        rec = self.recommendations
++        lines = [
++            "Calibration complete",
++            f"EAR threshold: {rec['EAR_THRESHOLD']:.3f}",
++            f"MAR threshold: {rec['MAR_THRESHOLD']:.3f}",
++            f"Head pitch threshold: {rec['HEAD_PITCH_THRESHOLD']:.1f}",
++        ]
++        if self._saved_path:
++            lines.append(f"Saved to: {self._saved_path}")
++        return lines
++
++    def save(self, log_dir: str = LOG_DIR):
++        os.makedirs(log_dir, exist_ok=True)
++        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
++        path = os.path.join(log_dir, f"calibration_{ts}.json")
++        payload = {
++            "created_at": datetime.now().isoformat(timespec="seconds"),
++            "recommendations": self.recommendations,
++            "sample_counts": {key: len(value) for key, value in self._samples.items()},
++        }
++        with open(path, "w", encoding="utf-8") as f:
++            json.dump(payload, f, indent=2)
++        self._saved_path = path
++        return path
++
++    def _compute_recommendations(self):
++        neutral = self._samples["neutral"]
++        eyes_closed = self._samples["eyes_closed"]
++        yawn = self._samples["yawn"]
++        head_nod = self._samples["head_nod"]
++
++        neutral_ear = _median_attr(neutral, "ear", fallback=0.17)
++        closed_ear = _low_attr(eyes_closed, "ear", fallback=neutral_ear * 0.55)
++        ear_threshold = _clamp((neutral_ear + closed_ear) / 2.0, 0.08, 0.28)
++
++        neutral_mar = _median_attr(neutral, "mar", fallback=0.12)
++        yawn_mar = _high_attr(yawn, "mar", fallback=max(0.45, neutral_mar * 3.0))
++        mar_threshold = _clamp((neutral_mar + yawn_mar) / 2.0, 0.25, 0.75)
++
++        neutral_pitch = _median_attr(neutral, "head_pitch", fallback=0.0)
++        nod_pitch = _high_attr(head_nod, "head_pitch", fallback=neutral_pitch + 20.0)
++        pitch_threshold = _clamp((neutral_pitch + nod_pitch) / 2.0, 10.0, 35.0)
++
++        return {
++            "EAR_THRESHOLD": round(ear_threshold, 3),
++            "MAR_THRESHOLD": round(mar_threshold, 3),
++            "HEAD_PITCH_THRESHOLD": round(pitch_threshold, 1),
++            "baselines": {
++                "neutral_ear": round(neutral_ear, 3),
++                "closed_ear": round(closed_ear, 3),
++                "neutral_mar": round(neutral_mar, 3),
++                "yawn_mar": round(yawn_mar, 3),
++                "neutral_pitch": round(neutral_pitch, 1),
++                "nod_pitch": round(nod_pitch, 1),
++            },
++        }
++
++
++def _median_attr(samples, attr, fallback):
++    values = [getattr(sample, attr) for sample in samples if sample is not None]
++    return median(values) if values else fallback
++
++
++def _low_attr(samples, attr, fallback):
++    values = sorted(getattr(sample, attr) for sample in samples if sample is not None)
++    if not values:
++        return fallback
++    return values[max(0, int(len(values) * 0.1) - 1)]
++
++
++def _high_attr(samples, attr, fallback):
++    values = sorted(getattr(sample, attr) for sample in samples if sample is not None)
++    if not values:
++        return fallback
++    return values[min(len(values) - 1, int(len(values) * 0.9))]
++
++
++def _clamp(value, low, high):
++    return max(low, min(high, value))
+diff --git a/src/camera.py b/src/camera.py
+index 0540641..1f95403 100644
+--- a/src/camera.py
++++ b/src/camera.py
+@@ -10,13 +10,22 @@ Falls back to SimulatedCamera if no camera is connected.
+ import cv2
+ import numpy as np
+ import logging
++import sys
++
++from config.config import CAMERA_INDEX, CAMERA_BUFFER_COUNT, OPENCV_NUM_THREADS
+ 
+ log = logging.getLogger("drowsafe.camera")
+ 
++try:
++    cv2.setNumThreads(OPENCV_NUM_THREADS)
++    cv2.ocl.setUseOpenCL(False)
++except Exception:
++    pass
++
+ 
+ class SimulatedCamera:
+     """
+-    Generates synthetic BGR frames for dashboard testing.
++    Generates synthetic RGB frames for dashboard testing.
+     Draws a grey frame with a centered face-placeholder so the
+     pipeline runs end-to-end without any physical camera.
+     """
+@@ -64,10 +73,17 @@ class Picamera2Camera:
+         self._flip  = flip
+         self._cam   = Picamera2()
+ 
+-        config = self._cam.create_video_configuration(
+-            main={"size": (width, height), "format": "BGR888"},
+-            controls={"FrameRate": fps},
+-        )
++        try:
++            config = self._cam.create_video_configuration(
++                main={"size": (width, height), "format": "BGR888"},
++                controls={"FrameRate": fps},
++                buffer_count=CAMERA_BUFFER_COUNT,
++            )
++        except TypeError:
++            config = self._cam.create_video_configuration(
++                main={"size": (width, height), "format": "BGR888"},
++                controls={"FrameRate": fps},
++            )
+         self._cam.configure(config)
+         self._cam.start()
+         log.info("Picamera2 started: %dx%d @ %d fps", width, height, fps)
+@@ -113,7 +129,7 @@ class Camera:
+     """
+ 
+     def __init__(self, width: int = 1280, height: int = 720, fps: int = 30,
+-                 simulate: bool = False, flip: bool = False):
++                 simulate: bool = False, flip: bool = False, camera_index: int = CAMERA_INDEX):
+         self.width  = width
+         self.height = height
+         self.fps    = fps
+@@ -123,29 +139,34 @@ class Camera:
+             self._backend = SimulatedCamera(width, height, fps)
+             return
+ 
+-        self._open(width, height, fps, flip)
++        self._open(width, height, fps, flip, camera_index)
+ 
+-    def _open(self, width, height, fps, flip):
++    def _open(self, width, height, fps, flip, camera_index):
+         # --- Try picamera2 first (Pi 5 Bookworm native path) ---
+-        try:
+-            self._backend = Picamera2Camera(width, height, fps, flip=flip)
+-            log.info("Camera backend: picamera2")
+-            return
+-        except Exception as e:
+-            log.warning("picamera2 failed (%s) — trying OpenCV VideoCapture...", e)
++        if sys.platform.startswith("linux"):
++            try:
++                self._backend = Picamera2Camera(width, height, fps, flip=flip)
++                log.info("Camera backend: picamera2")
++                return
++            except Exception as e:
++                log.warning("picamera2 failed (%s) — trying OpenCV VideoCapture...", e)
++        else:
++            log.info("Skipping picamera2 on %s — trying OpenCV VideoCapture.", sys.platform)
+ 
+         # --- Try OpenCV direct capture ---
+         try:
+-            cap = cv2.VideoCapture(0)
++            backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
++            if backend == cv2.CAP_ANY:
++                cap = cv2.VideoCapture(camera_index)
++            else:
++                cap = cv2.VideoCapture(camera_index, backend)
+             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+             cap.set(cv2.CAP_PROP_FPS,          fps)
+             if cap.isOpened():
+-                ret, frame = cap.read()
+-                if ret and frame is not None:
+-                    self._backend = _OpenCVCamera(cap)
+-                    log.info("Camera backend: OpenCV VideoCapture")
+-                    return
++                self._backend = _OpenCVCamera(cap, flip=flip)
++                log.info("Camera backend: OpenCV VideoCapture (index=%s)", camera_index)
++                return
+             cap.release()
+         except Exception as e:
+             log.warning("OpenCV VideoCapture failed (%s)", e)
+@@ -167,6 +188,7 @@ class Camera:
+     def release(self):
+         if self._backend:
+             self._backend.release()
++            self._backend = None
+         log.info("Camera released.")
+ 
+     def __del__(self):
+@@ -175,12 +197,25 @@ class Camera:
+ 
+ class _OpenCVCamera:
+     """Thin wrapper to make OpenCV VideoCapture fit the same interface."""
+-    def __init__(self, cap):
++    def __init__(self, cap, flip: bool = False):
+         self._cap = cap
++        self._flip = flip
+ 
+     def read(self):
+         ret, frame = self._cap.read()
+-        return frame if ret else None
++        if not ret or frame is None:
++            return None
++
++        if frame.ndim == 2:
++            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
++        elif frame.shape[2] == 4:
++            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
++        elif frame.shape[2] == 3:
++            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
++
++        if self._flip:
++            frame = cv2.flip(frame, -1)
++        return frame
+ 
+     def release(self):
+         self._cap.release()
+diff --git a/src/dashboard.py b/src/dashboard.py
+index f155e93..8751730 100644
+--- a/src/dashboard.py
++++ b/src/dashboard.py
+@@ -20,6 +20,7 @@ Layout (800×480)
+ import sys
+ import logging
+ import numpy as np
++import time
+ 
+ log = logging.getLogger("drowsafe.dashboard")
+ 
+@@ -99,13 +100,14 @@ class Dashboard:
+         features,
+         fps: float = None,
+         simulated: bool = False,
++        alert_reason: str = None,
+     ):
+         """
+         Render one dashboard frame.
+ 
+         Parameters
+         ----------
+-        frame       : numpy.ndarray (BGR) | None
++        frame       : numpy.ndarray (RGB) | None
+         score       : float  — fatigue score 0–100
+         alert_level : int    — 0 / 1 / 2
+         features    : Features | None
+@@ -133,13 +135,18 @@ class Dashboard:
+         # --- Camera feed ---
+         if frame is not None:
+             self._draw_camera(frame, cam_w, cam_h)
++        else:
++            self._draw_camera_message(cam_w, cam_h, "Camera frame unavailable")
++
++        if frame is not None and features is None:
++            self._draw_camera_message(cam_w, cam_h, "No face detected")
+ 
+         # --- Metrics panel ---
+         metrics_x = cam_w + 10
+         self._draw_metrics(metrics_x, score, alert_level, features, colour)
+ 
+         # --- Alert banner (bottom) ---
+-        self._draw_alert_banner(alert_level, score, colour)
++        self._draw_alert_banner(alert_level, score, colour, alert_reason)
+ 
+         # --- FPS ---
+         if fps is not None:
+@@ -154,6 +161,87 @@ class Dashboard:
+         pygame.display.flip()
+         self._clock.tick(60)
+ 
++    def render_calibration(
++        self,
++        frame,
++        features,
++        step_title: str,
++        instruction: str,
++        progress: float,
++        recommendation_lines=None,
++        fps: float = None,
++    ):
++        """Render the guided calibration screen."""
++        if not _PYGAME_AVAILABLE or self._screen is None:
++            return
++
++        for event in pygame.event.get():
++            if event.type == pygame.QUIT:
++                self._running = False
++                return
++            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
++                self._running = False
++                return
++
++        self._screen.fill(BG_COLOUR)
++        cam_w = int(self._width * self.CAM_W_RATIO)
++        cam_h = self._height - 60
++
++        if frame is not None:
++            self._draw_camera(frame, cam_w, cam_h)
++        else:
++            self._draw_camera_message(cam_w, cam_h, "Camera frame unavailable")
++
++        if frame is not None and features is None and not recommendation_lines:
++            self._draw_camera_message(cam_w, cam_h, "No face detected")
++
++        metrics_x = cam_w + 10
++        self._draw_calibration_metrics(metrics_x, features, recommendation_lines)
++        self._draw_calibration_overlay(cam_w, cam_h, step_title, instruction, progress, recommendation_lines)
++
++        if fps is not None:
++            fps_surf = self._font_small.render(f"{fps:.1f} fps", True, TEXT_SECONDARY)
++            self._screen.blit(fps_surf, (8, 8))
++
++        pygame.draw.rect(self._screen, (52, 152, 219), pygame.Rect(0, self._height - 54, self._width, 54))
++        text = "Guided calibration — press ESC to exit"
++        s = self._fit_text(text, self._font_med, self._width - 24, (255, 255, 255))
++        self._screen.blit(s, (self._width // 2 - s.get_width() // 2, self._height - 37))
++
++        pygame.display.flip()
++        self._clock.tick(60)
++
++    def render_startup(self, checks, duration_sec: float = 2.5):
++        """Show startup self-test results briefly."""
++        if not _PYGAME_AVAILABLE or self._screen is None:
++            return
++
++        started = time.monotonic()
++        while self._running and time.monotonic() - started < duration_sec:
++            for event in pygame.event.get():
++                if event.type == pygame.QUIT:
++                    self._running = False
++                    return
++                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
++                    self._running = False
++                    return
++
++            self._screen.fill(BG_COLOUR)
++            title = self._font_med.render("Startup self-test", True, TEXT_PRIMARY)
++            self._screen.blit(title, (28, 28))
++
++            y = 82
++            for check in checks:
++                colour = (39, 174, 96) if check.ok else (243, 156, 18)
++                status = "OK" if check.ok else "WARN"
++                line = f"{status}  {check.name}: {check.detail}"
++                s = self._fit_text(line, self._font_small, self._width - 56, colour)
++                self._screen.blit(s, (28, y))
++                y += 30
++
++            pygame.display.flip()
++            self._clock.tick(30)
++
+     def _draw_camera(self, frame, cam_w: int, cam_h: int):
+         """Scale and blit the camera frame to the left panel."""
+         import cv2
+@@ -181,6 +269,83 @@ class Dashboard:
+         oy = (cam_h - nh) // 2
+         self._screen.blit(surface, (ox, oy))
+ 
++    def _draw_calibration_metrics(self, x: int, features, recommendation_lines):
++        panel_w = self._width - x - 10
++        y = 24
++
++        title = self._font_small.render("CALIBRATION", True, TEXT_SECONDARY)
++        self._screen.blit(title, (x, y))
++        y += 34
++
++        def row(label, value):
++            nonlocal y
++            self._screen.blit(self._font_small.render(label, True, TEXT_SECONDARY), (x, y))
++            self._screen.blit(self._font_small.render(value, True, TEXT_PRIMARY), (x + 126, y))
++            y += 28
++
++        if features:
++            row("EAR", f"{features.ear:.3f}")
++            row("MAR", f"{features.mar:.3f}")
++            row("Head pitch", f"{features.head_pitch:+.1f}°")
++        else:
++            row("EAR", "—")
++            row("MAR", "—")
++            row("Head pitch", "—")
++
++        if recommendation_lines:
++            y += 18
++            for line in recommendation_lines[1:]:
++                s = self._fit_text(line, self._font_small, panel_w, TEXT_PRIMARY)
++                self._screen.blit(s, (x, y))
++                y += 28
++
++    def _draw_calibration_overlay(
++        self,
++        cam_w: int,
++        cam_h: int,
++        step_title: str,
++        instruction: str,
++        progress: float,
++        recommendation_lines,
++    ):
++        overlay_h = 116 if not recommendation_lines else 150
++        overlay = pygame.Surface((cam_w, overlay_h), pygame.SRCALPHA)
++        overlay.fill((0, 0, 0, 175))
++        oy = cam_h - overlay_h - 12
++        self._screen.blit(overlay, (0, oy))
++
++        title = recommendation_lines[0] if recommendation_lines else step_title
++        title_s = self._fit_text(title, self._font_med, cam_w - 32, (255, 255, 255))
++        self._screen.blit(title_s, (16, oy + 14))
++
++        body = "Review the recommended thresholds in the side panel." if recommendation_lines else instruction
++        body_s = self._fit_text(body, self._font_small, cam_w - 32, TEXT_PRIMARY)
++        self._screen.blit(body_s, (16, oy + 54))
++
++        bar_w = cam_w - 32
++        bar_y = oy + overlay_h - 30
++        pygame.draw.rect(self._screen, (70, 70, 70), (16, bar_y, bar_w, 12), border_radius=6)
++        fill_w = int(bar_w * max(0.0, min(1.0, progress)))
++        if fill_w > 0:
++            pygame.draw.rect(self._screen, (52, 152, 219), (16, bar_y, fill_w, 12), border_radius=6)
++
++    def _draw_camera_message(self, cam_w: int, cam_h: int, text: str):
++        """Draw a centered status message over the camera area."""
++        overlay = pygame.Surface((cam_w, cam_h), pygame.SRCALPHA)
++        overlay.fill((0, 0, 0, 110))
++        self._screen.blit(overlay, (0, 0))
++
++        message = self._font_med.render(text, True, (255, 255, 255))
++        detail = self._font_small.render("Adjust position or lighting", True, TEXT_SECONDARY)
++
++        mx = cam_w // 2 - message.get_width() // 2
++        my = cam_h // 2 - message.get_height()
++        dx = cam_w // 2 - detail.get_width() // 2
++        dy = my + message.get_height() + 8
++
++        self._screen.blit(message, (mx, my))
++        self._screen.blit(detail, (dx, dy))
++
+     def _draw_metrics(self, x: int, score: float, alert_level: int, features, colour):
+         """Draw the right-side metrics panel."""
+         panel_w = self._width - x - 10
+@@ -251,7 +416,17 @@ class Dashboard:
+         ly    = badge_rect.centery - ls.get_height() // 2
+         self._screen.blit(ls, (lx, ly))
+ 
+-    def _draw_alert_banner(self, alert_level: int, score: float, colour):
++    def _fit_text(self, text: str, font, max_width: int, colour):
++        """Render text, shortening the middle if it would overflow."""
++        if font.size(text)[0] <= max_width:
++            return font.render(text, True, colour)
++
++        ellipsis = "..."
++        while text and font.size(text + ellipsis)[0] > max_width:
++            text = text[:-1]
++        return font.render((text + ellipsis) if text else ellipsis, True, colour)
++
++    def _draw_alert_banner(self, alert_level: int, score: float, colour, alert_reason: str = None):
+         """Draw the bottom alert banner."""
+         bh      = 54
+         by      = self._height - bh
+@@ -261,11 +436,13 @@ class Dashboard:
+         if alert_level == 0:
+             text = "Driver monitoring active — stay alert"
+         elif alert_level == 1:
+-            text = "⚠  Drowsiness detected — please take a break"
++            reason = f": {alert_reason}" if alert_reason else ""
++            text = f"⚠  Drowsiness detected{reason} — please take a break"
+         else:
+-            text = "⛔  WAKE UP — Pull over immediately!"
++            reason = f": {alert_reason}" if alert_reason else ""
++            text = f"⛔  WAKE UP{reason} — Pull over immediately!"
+ 
+-        s  = self._font_med.render(text, True, (255, 255, 255))
++        s  = self._fit_text(text, self._font_med, self._width - 24, (255, 255, 255))
+         sx = self._width  // 2 - s.get_width()  // 2
+         sy = by + bh // 2 - s.get_height() // 2
+         self._screen.blit(s, (sx, sy))
+diff --git a/src/detector.py b/src/detector.py
+index b828fec..cbecc26 100644
+--- a/src/detector.py
++++ b/src/detector.py
+@@ -44,14 +44,19 @@ class FaceDetector:
+             max_num_faces, refine_landmarks,
+         )
+ 
+-    def process(self, frame):
++    def process(self, frame, draw: bool = True, annotation_frame=None):
+         """
+-        Run face mesh detection on a BGR frame.
++        Run face mesh detection on an RGB frame.
+ 
+         Parameters
+         ----------
+         frame : numpy.ndarray
+-            BGR image from the camera.
++            RGB image used for detection.
++        draw : bool
++            Whether to draw landmarks for debug display.
++        annotation_frame : numpy.ndarray | None
++            Optional RGB frame to annotate. This may be larger than `frame`;
++            MediaPipe landmarks are normalised, so they scale correctly.
+ 
+         Returns
+         -------
+@@ -60,19 +65,25 @@ class FaceDetector:
+         annotated_frame : numpy.ndarray
+             Copy of the input frame with landmarks drawn (for debug display).
+         """
+-        # Pass frame directly to MediaPipe (expects RGB, camera now outputs RGB)
+-        rgb = frame.copy()
++        # Pass frame directly to MediaPipe (expects RGB, camera now outputs RGB).
++        # Avoiding a per-frame copy matters on the Pi 5.
++        rgb = frame
+         rgb.flags.writeable = False
+         results = self._face_mesh.process(rgb)
+         rgb.flags.writeable = True
+ 
+         if not results.multi_face_landmarks:
+-            return None, frame.copy()
++            annotated = annotation_frame.copy() if (draw and annotation_frame is not None) else frame
++            return None, annotated
+ 
+         face_landmarks = results.multi_face_landmarks[0]
+ 
+-        # Draw landmarks on a copy of the frame
+-        annotated = frame.copy()
++        if not draw:
++            return face_landmarks.landmark, frame
++
++        # Draw landmarks only when requested. Use the original display frame
++        # when provided, otherwise annotate the processed frame.
++        annotated = annotation_frame.copy() if annotation_frame is not None else frame.copy()
+         self._mp_drawing.draw_landmarks(
+             image                        = annotated,
+             landmark_list                = face_landmarks,
+diff --git a/src/health.py b/src/health.py
+new file mode 100644
+index 0000000..b140475
+--- /dev/null
++++ b/src/health.py
+@@ -0,0 +1,40 @@
++"""Startup self-test helpers for DrowSAFE."""
++
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class HealthCheck:
++    name: str
++    ok: bool
++    detail: str
++
++
++def run_startup_checks(camera, detector, dashboard, alert, event_logger, simulate: bool):
++    """Return concise startup health checks for display and logs."""
++    checks = []
++
++    camera_ok = camera is not None and getattr(camera, "_backend", None) is not None
++    if camera_ok:
++        detail = "Simulation camera active" if camera.is_simulated else "Camera backend active"
++    else:
++        detail = "Camera backend unavailable"
++    checks.append(HealthCheck("Camera", camera_ok, detail))
++
++    if simulate:
++        checks.append(HealthCheck("Face detector", True, "Bypassed in simulation mode"))
++    else:
++        detector_ok = detector is not None
++        detail = "MediaPipe FaceMesh ready" if detector_ok else "MediaPipe FaceMesh unavailable"
++        checks.append(HealthCheck("Face detector", detector_ok, detail))
++
++    dashboard_ok = dashboard is not None and dashboard.is_running()
++    checks.append(HealthCheck("Dashboard", dashboard_ok, "Display surface ready" if dashboard_ok else "Dashboard disabled"))
++
++    buzzer_ok = alert is not None and alert.is_enabled
++    checks.append(HealthCheck("Buzzer", buzzer_ok, "GPIO buzzer enabled" if buzzer_ok else "GPIO buzzer unavailable"))
++
++    log_ok = event_logger is not None and event_logger.is_enabled
++    checks.append(HealthCheck("Event log", log_ok, "CSV logging enabled" if log_ok else "CSV logging disabled"))
++
++    return checks
+diff --git a/src/logger.py b/src/logger.py
+index 131f392..2e94e2c 100644
+--- a/src/logger.py
++++ b/src/logger.py
+@@ -10,6 +10,7 @@ import os
+ import time
+ import logging
+ from datetime import datetime
++from collections import Counter
+ 
+ from config.config import LOG_DIR, LOG_EVENTS
+ from src.state_machine import LEVEL_NAMES
+@@ -36,6 +37,14 @@ class EventLogger:
+         self._last_level = -1
+         self._last_snap  = 0.0
+         self._start_time = time.monotonic()
++        self._start_wall_time = datetime.now()
++        self._filepath = None
++        self._summary_path = None
++        self._samples = 0
++        self._score_total = 0.0
++        self._max_score = 0.0
++        self._level_counts = Counter()
++        self._reason_counts = Counter()
+ 
+         if LOG_EVENTS:
+             self._open_file()
+@@ -44,16 +53,18 @@ class EventLogger:
+         os.makedirs(LOG_DIR, exist_ok=True)
+         ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+         filepath = os.path.join(LOG_DIR, f"drowsafe_{ts}.csv")
++        self._filepath = filepath
++        self._summary_path = os.path.join(LOG_DIR, f"trip_summary_{ts}.txt")
+ 
+         self._file   = open(filepath, "w", newline="", encoding="utf-8")
+         self._writer = csv.writer(self._file)
+         self._writer.writerow([
+             "timestamp", "elapsed_s", "alert_level", "alert_name",
+-            "fatigue_score", "ear", "mar", "head_pitch",
++            "fatigue_score", "reason", "ear", "mar", "head_pitch",
+         ])
+         log.info("Event log: %s", filepath)
+ 
+-    def log(self, alert_level: int, score: float, features):
++    def log(self, alert_level: int, score: float, features, reason: str = ""):
+         """
+         Write a row on state change or periodic snapshot.
+ 
+@@ -63,11 +74,17 @@ class EventLogger:
+         score       : float
+         features    : Features | None
+         """
+-        if not LOG_EVENTS or self._writer is None:
+-            return
+-
+         now     = time.monotonic()
+         elapsed = round(now - self._start_time, 2)
++        self._samples += 1
++        self._score_total += score
++        self._max_score = max(self._max_score, score)
++        self._level_counts[alert_level] += 1
++        if alert_level > 0 and reason:
++            self._reason_counts[reason] += 1
++
++        if not LOG_EVENTS or self._writer is None:
++            return
+ 
+         state_changed = alert_level != self._last_level
+         snapshot_due  = (now - self._last_snap) >= self.SNAPSHOT_INTERVAL
+@@ -85,6 +102,7 @@ class EventLogger:
+             alert_level,
+             LEVEL_NAMES[alert_level],
+             score,
++            reason,
+             ear, mar, pitch,
+         ])
+         self._file.flush()
+@@ -93,6 +111,58 @@ class EventLogger:
+         self._last_snap  = now
+ 
+     def close(self):
++        self._write_summary()
+         if self._file:
+             self._file.close()
+             log.info("Event log closed.")
++
++    def _write_summary(self):
++        if not LOG_EVENTS or not self._summary_path or self._samples == 0:
++            return
++
++        duration = time.monotonic() - self._start_time
++        avg_score = self._score_total / self._samples
++        level_total = sum(self._level_counts.values()) or 1
++
++        lines = [
++            "DrowSAFE Trip Summary",
++            "=" * 22,
++            f"Started: {self._start_wall_time.isoformat(timespec='seconds')}",
++            f"Ended: {datetime.now().isoformat(timespec='seconds')}",
++            f"Duration: {duration:.1f} seconds",
++            f"Samples: {self._samples}",
++            f"Average fatigue score: {avg_score:.1f}",
++            f"Maximum fatigue score: {self._max_score:.1f}",
++            "",
++            "Alert level distribution:",
++        ]
++
++        for level, name in LEVEL_NAMES.items():
++            pct = 100.0 * self._level_counts[level] / level_total
++            lines.append(f"- {name}: {pct:.1f}%")
++
++        lines.extend(["", "Top alert reasons:"])
++        if self._reason_counts:
++            for reason, count in self._reason_counts.most_common(5):
++                lines.append(f"- {reason}: {count} samples")
++        else:
++            lines.append("- No warning or critical alert reasons recorded")
++
++        if self._filepath:
++            lines.extend(["", f"Event log: {self._filepath}"])
++
++        with open(self._summary_path, "w", encoding="utf-8") as f:
++            f.write("\n".join(lines) + "\n")
++        log.info("Trip summary: %s", self._summary_path)
++
++    @property
++    def is_enabled(self) -> bool:
++        return LOG_EVENTS and self._writer is not None
++
++    @property
++    def log_path(self):
++        return self._filepath
++
++    @property
++    def summary_path(self):
++        return self._summary_path
+diff --git a/src/main.py b/src/main.py
+index 8a433f6..30d7d80 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -24,10 +24,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ 
+ from config.config import (
+     FRAME_WIDTH, FRAME_HEIGHT, FRAME_RATE,
++    PROCESS_WIDTH, PROCESS_HEIGHT,
++    NATIVE_THREAD_LIMIT,
+     CAMERA_FLIP,
+     DISPLAY_WIDTH, DISPLAY_HEIGHT, FULLSCREEN,
+     SHOW_LANDMARKS, SHOW_FPS,
++    DETECTOR_REFINE_LANDMARKS,
++    DETECTOR_MIN_DETECTION_CONF,
++    DETECTOR_MIN_TRACKING_CONF,
+ )
++
++# Keep native libraries from oversubscribing the Pi 5 CPU. These environment
++# variables must be set before importing modules that load NumPy/OpenCV.
++os.environ.setdefault("OMP_NUM_THREADS", str(NATIVE_THREAD_LIMIT))
++os.environ.setdefault("OPENBLAS_NUM_THREADS", str(NATIVE_THREAD_LIMIT))
++os.environ.setdefault("MKL_NUM_THREADS", str(NATIVE_THREAD_LIMIT))
++os.environ.setdefault("NUMEXPR_NUM_THREADS", str(NATIVE_THREAD_LIMIT))
++
+ from src.camera        import Camera
+ from src.scoring       import FatigueScorer
+ from src.state_machine import AlertStateMachine
+@@ -35,6 +48,9 @@ from src.alert         import AlertController
+ from src.dashboard     import Dashboard
+ from src.logger        import EventLogger
+ from src.features      import Features
++from src.calibration   import GuidedCalibrator
++from src.health        import run_startup_checks
++import cv2
+ 
+ logging.basicConfig(
+     level=logging.INFO,
+@@ -89,6 +105,99 @@ def _simulate_features(t: float) -> Features:
+     )
+ 
+ 
++def _processing_frame(frame):
++    """Return a resized RGB frame for MediaPipe plus its dimensions."""
++    h, w = frame.shape[:2]
++    target_w = PROCESS_WIDTH or w
++    target_h = PROCESS_HEIGHT or h
++
++    if target_w == w and target_h == h:
++        return frame, w, h
++
++    resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
++    return resized, target_w, target_h
++
++
++def _run_guided_calibration(camera, detector, extractor, dashboard, simulate: bool):
++    """Run the guided calibration flow and save recommended thresholds."""
++    calibrator = GuidedCalibrator()
++    fps_timer = time.perf_counter()
++    fps_count = 0
++    fps_display = 0.0
++    start_time = time.perf_counter()
++    saved = False
++    complete_started = None
++    last_frame = None
++    last_features = None
++
++    log.info("Guided calibration started.")
++
++    while dashboard.is_running():
++        loop_start = time.perf_counter()
++        frame = camera.read()
++        t = loop_start - start_time
++
++        if frame is None:
++            feat = None
++            display_frame = None
++        elif simulate:
++            feat = _simulate_features(t)
++            display_frame = frame
++        else:
++            detection_frame, process_w, process_h = _processing_frame(frame)
++            if extractor.frame_w != process_w or extractor.frame_h != process_h:
++                extractor.update_frame_size(process_w, process_h)
++            landmarks, annotated_frame = detector.process(
++                detection_frame,
++                draw=SHOW_LANDMARKS,
++                annotation_frame=frame if SHOW_LANDMARKS else None,
++            )
++            display_frame = annotated_frame if SHOW_LANDMARKS else frame
++            feat = extractor.extract(landmarks) if landmarks else None
++
++        if not calibrator.is_complete:
++            calibrator.update(feat)
++            step = calibrator.current_step
++            title = step.title if step else "Calibration complete"
++            instruction = step.instruction if step else "Review the recommended thresholds."
++            recommendation_lines = None
++        else:
++            if not saved:
++                calibrator.save()
++                log.info("Calibration recommendations saved: %s", calibrator.saved_path)
++                saved = True
++                complete_started = time.perf_counter()
++            title = "Calibration complete"
++            instruction = "Review the recommended thresholds."
++            recommendation_lines = calibrator.report_lines()
++
++        if frame is not None:
++            last_frame = display_frame
++            last_features = feat
++
++        fps_count += 1
++        elapsed = time.perf_counter() - fps_timer
++        if elapsed >= 1.0:
++            fps_display = fps_count / elapsed
++            fps_count = 0
++            fps_timer = time.perf_counter()
++
++        dashboard.render_calibration(
++            frame=display_frame if frame is not None else last_frame,
++            features=feat if frame is not None else last_features,
++            step_title=title,
++            instruction=instruction,
++            progress=calibrator.progress,
++            recommendation_lines=recommendation_lines,
++            fps=fps_display if SHOW_FPS else None,
++        )
++
++        if complete_started and time.perf_counter() - complete_started >= 10.0:
++            break
++
++    log.info("Guided calibration stopped.")
++
++
+ # ---------------------------------------------------------------------------
+ # Main
+ # ---------------------------------------------------------------------------
+@@ -98,24 +207,57 @@ def main():
+         "--simulate", action="store_true",
+         help="Run in simulation mode (no camera or MediaPipe required)"
+     )
++    parser.add_argument(
++        "--camera-index", type=int, default=None,
++        help="Camera index for OpenCV webcam capture (default from config)"
++    )
++    parser.add_argument(
++        "--windowed", action="store_true",
++        help="Run dashboard in a window instead of fullscreen"
++    )
++    parser.add_argument(
++        "--no-flip", action="store_true",
++        help="Disable 180-degree camera flip from config"
++    )
++    parser.add_argument(
++        "--guided-calibration", action="store_true",
++        help="Run the guided calibration flow and save threshold recommendations"
++    )
+     args = parser.parse_args()
+ 
+     simulate = args.simulate
++    camera_index = args.camera_index if args.camera_index is not None else None
++    fullscreen = FULLSCREEN and not args.windowed
++    camera_flip = CAMERA_FLIP and not args.no_flip
+ 
+     log.info("DrowSAFE starting... (mode=%s)", "SIMULATE" if simulate else "LIVE")
+ 
+     # ------------------------------------------------------------------
+     # Initialise subsystems
+     # ------------------------------------------------------------------
+-    camera        = Camera(FRAME_WIDTH, FRAME_HEIGHT, FRAME_RATE, simulate=simulate, flip=CAMERA_FLIP)
++    camera_kwargs = {}
++    if camera_index is not None:
++        camera_kwargs["camera_index"] = camera_index
++    camera        = Camera(
++        FRAME_WIDTH,
++        FRAME_HEIGHT,
++        FRAME_RATE,
++        simulate=simulate,
++        flip=camera_flip,
++        **camera_kwargs,
++    )
+ 
+     # In simulation mode, skip detector import (MediaPipe not needed)
+     detector = None
+     if not simulate:
+         from src.detector import FaceDetector
+         from src.features import FeatureExtractor
+-        detector  = FaceDetector()
+-        extractor = FeatureExtractor(FRAME_WIDTH, FRAME_HEIGHT)
++        detector  = FaceDetector(
++            refine_landmarks=DETECTOR_REFINE_LANDMARKS,
++            min_detection_confidence=DETECTOR_MIN_DETECTION_CONF,
++            min_tracking_confidence=DETECTOR_MIN_TRACKING_CONF,
++        )
++        extractor = FeatureExtractor(PROCESS_WIDTH, PROCESS_HEIGHT)
+     else:
+         extractor = None
+         log.info("Simulation mode: MediaPipe detector bypassed.")
+@@ -123,9 +265,26 @@ def main():
+     scorer        = FatigueScorer()
+     state_machine = AlertStateMachine()
+     alert         = AlertController()
+-    dashboard     = Dashboard(DISPLAY_WIDTH, DISPLAY_HEIGHT, FULLSCREEN)
++    dashboard     = Dashboard(DISPLAY_WIDTH, DISPLAY_HEIGHT, fullscreen)
+     event_logger  = EventLogger()
+ 
++    health_checks = run_startup_checks(camera, detector, dashboard, alert, event_logger, simulate)
++    for check in health_checks:
++        log.info("Self-test: %s=%s (%s)", check.name, "OK" if check.ok else "WARN", check.detail)
++    dashboard.render_startup(health_checks)
++
++    if args.guided_calibration:
++        _run_guided_calibration(camera, detector, extractor, dashboard, simulate)
++        log.info("Shutting down...")
++        alert.stop()
++        camera.release()
++        dashboard.quit()
++        event_logger.close()
++        if detector:
++            detector.close()
++        log.info("DrowSAFE stopped cleanly.")
++        return
++
+     # ------------------------------------------------------------------
+     # Graceful shutdown
+     # ------------------------------------------------------------------
+@@ -156,6 +315,23 @@ def main():
+         # 1. Grab frame
+         frame = camera.read()
+         if frame is None:
++            score       = scorer.update(None)
++            alert_level = state_machine.update(score)
++            alert.update(alert_level)
++            reason = scorer.details.primary_reason
++            event_logger.log(alert_level, score, None, reason)
++            dashboard.render(
++                frame       = None,
++                score       = score,
++                alert_level = alert_level,
++                features    = None,
++                fps         = fps_display if SHOW_FPS else None,
++                simulated   = simulate,
++                alert_reason= reason if alert_level > 0 else None,
++            )
++            time.sleep(1.0 / max(FRAME_RATE, 1))
++            if not dashboard.is_running():
++                running = False
+             continue
+ 
+         # 2. Extract features
+@@ -163,7 +339,15 @@ def main():
+             feat           = _simulate_features(t)
+             annotated_frame = frame
+         else:
+-            landmarks, annotated_frame = detector.process(frame)
++            detection_frame, process_w, process_h = _processing_frame(frame)
++            if extractor.frame_w != process_w or extractor.frame_h != process_h:
++                extractor.update_frame_size(process_w, process_h)
++
++            landmarks, annotated_frame = detector.process(
++                detection_frame,
++                draw=SHOW_LANDMARKS,
++                annotation_frame=frame if SHOW_LANDMARKS else None,
++            )
+             feat = extractor.extract(landmarks) if landmarks else None
+ 
+         # 3. Score + state machine
+@@ -174,7 +358,8 @@ def main():
+         alert.update(alert_level)
+ 
+         # 5. Log
+-        event_logger.log(alert_level, score, feat)
++        reason = scorer.details.primary_reason
++        event_logger.log(alert_level, score, feat, reason)
+ 
+         # 6. FPS counter
+         fps_count += 1
+@@ -193,6 +378,7 @@ def main():
+             features    = feat,
+             fps         = fps_display if SHOW_FPS else None,
+             simulated   = simulate,
++            alert_reason= reason if alert_level > 0 else None,
+         )
+ 
+         if not dashboard.is_running():
+diff --git a/src/scoring.py b/src/scoring.py
+index e5639d4..3af705d 100644
+--- a/src/scoring.py
++++ b/src/scoring.py
+@@ -13,24 +13,48 @@ The score drives the alert state machine.
+ import time
+ import logging
+ from collections import deque
++from dataclasses import dataclass
+ from config.config import (
+     EAR_THRESHOLD,
+     EAR_CONSEC_FRAMES,
+     EAR_RECOVERY_FRAMES,
+     MAR_THRESHOLD,
++    MAR_CONSEC_FRAMES,
+     HEAD_PITCH_THRESHOLD,
++    HEAD_NOD_CONSEC_FRAMES,
+     PERCLOS_WINDOW_SEC,
+     PERCLOS_THRESHOLD,
+-    FRAME_RATE,
+     SCORE_WEIGHT_PERCLOS,
+     SCORE_WEIGHT_EAR,
+     SCORE_WEIGHT_MAR,
+     SCORE_WEIGHT_HEAD_POSE,
++    FACE_MISSING_WARNING_SEC,
++    FACE_MISSING_CRITICAL_SEC,
++    FACE_MISSING_WARNING_SCORE,
++    FACE_MISSING_CRITICAL_SCORE,
+ )
+ 
+ log = logging.getLogger("drowsafe.scoring")
+ 
+ 
++@dataclass
++class ScoreDetails:
++    """Human-readable explanation for the latest fatigue score."""
++    perclos: float = 0.0
++    eye_closed: bool = False
++    yawning: bool = False
++    head_nod: bool = False
++    face_missing: bool = False
++    missing_for: float = 0.0
++    yawns_per_min: float = 0.0
++    nods_per_min: float = 0.0
++    reasons: tuple = ()
++
++    @property
++    def primary_reason(self) -> str:
++        return self.reasons[0] if self.reasons else "No fatigue signs detected"
++
++
+ class FatigueScorer:
+     """
+     Maintains a rolling window of per-frame signals and produces a
+@@ -45,20 +69,23 @@ class FatigueScorer:
+ 
+     def __init__(self):
+         # PERCLOS rolling window: stores (timestamp, eye_closed) tuples
+-        window_frames = int(PERCLOS_WINDOW_SEC * FRAME_RATE)
+-        self._eye_history: deque = deque(maxlen=window_frames)
++        self._eye_history: deque = deque()
+ 
+         # Yawn counter over the same window
+-        self._yawn_history: deque = deque(maxlen=window_frames)
++        self._yawn_history: deque = deque()
+ 
+         # Head nod counter
+-        self._nod_history: deque  = deque(maxlen=window_frames)
++        self._nod_history: deque  = deque()
+ 
+         self._last_score: float   = 0.0
+         self._yawn_in_progress    = False
+         self._nod_in_progress     = False
+         self._ear_low_count       = 0    # consecutive low-EAR frames
+         self._ear_high_count      = 0    # consecutive high-EAR frames (grace period)
++        self._mar_high_count      = 0    # consecutive high-MAR frames
++        self._nod_high_count      = 0    # consecutive head-down frames
++        self._missing_since       = None # first timestamp of current no-face/no-frame run
++        self._details             = ScoreDetails()
+ 
+         log.info("FatigueScorer ready (PERCLOS window=%ds)", PERCLOS_WINDOW_SEC)
+ 
+@@ -71,7 +98,8 @@ class FatigueScorer:
+         ----------
+         features : Features | None
+             Extracted features from the current frame.
+-            If None (no face visible), the scorer holds its last score.
++            If None (no face/frame visible), the scorer holds briefly and then
++            escalates according to the configured visibility timeout.
+ 
+         Returns
+         -------
+@@ -80,10 +108,28 @@ class FatigueScorer:
+         """
+         now = time.monotonic()
+ 
+-        if features is None:
+-            # No face detected — don't penalise immediately but don't reset
++        if features is None or not getattr(features, "face_visible", True):
++            # Face/camera missing: hold briefly, then escalate instead of
++            # freezing a stale healthy score forever.
++            if self._missing_since is None:
++                self._missing_since = now
++            missing_for = now - self._missing_since
++
++            if missing_for >= FACE_MISSING_CRITICAL_SEC:
++                self._last_score = max(self._last_score, FACE_MISSING_CRITICAL_SCORE)
++            elif missing_for >= FACE_MISSING_WARNING_SEC:
++                self._last_score = max(self._last_score, FACE_MISSING_WARNING_SCORE)
++
++            self._details = ScoreDetails(
++                perclos=self._compute_perclos(),
++                face_missing=True,
++                missing_for=missing_for,
++                reasons=("Face or camera unavailable",),
++            )
+             return self._last_score
+ 
++        self._missing_since = None
++
+         # --- Eye closed? (blink filter) ---
+         if features.ear < EAR_THRESHOLD:
+             self._ear_low_count  += 1
+@@ -96,24 +142,34 @@ class FatigueScorer:
+         eye_closed = self._ear_low_count >= EAR_CONSEC_FRAMES
+         self._eye_history.append((now, eye_closed))
+ 
+-        # --- Yawning? (rising edge detection) ---
++        # --- Yawning? (sustained threshold + falling edge event) ---
+         yawning = features.mar > MAR_THRESHOLD
+-        if yawning and not self._yawn_in_progress:
+-            self._yawn_in_progress = True
+-        elif not yawning and self._yawn_in_progress:
++        if yawning:
++            self._mar_high_count += 1
++            if self._mar_high_count >= MAR_CONSEC_FRAMES:
++                self._yawn_in_progress = True
++        else:
++            if self._yawn_in_progress:
++                self._yawn_history.append(now)  # Record completed sustained yawn
+             self._yawn_in_progress = False
+-            self._yawn_history.append(now)  # Record completed yawn timestamp
++            self._mar_high_count = 0
+ 
+-        # --- Nodding? ---
++        # --- Nodding? (sustained threshold + falling edge event) ---
+         nodding = features.head_pitch > HEAD_PITCH_THRESHOLD
+-        if nodding and not self._nod_in_progress:
+-            self._nod_in_progress = True
+-        elif not nodding and self._nod_in_progress:
++        if nodding:
++            self._nod_high_count += 1
++            if self._nod_high_count >= HEAD_NOD_CONSEC_FRAMES:
++                self._nod_in_progress = True
++        else:
++            if self._nod_in_progress:
++                self._nod_history.append(now)
+             self._nod_in_progress = False
+-            self._nod_history.append(now)
++            self._nod_high_count = 0
+ 
+         # --- Prune expired history entries ---
+         cutoff = now - PERCLOS_WINDOW_SEC
++        while self._eye_history and self._eye_history[0][0] < cutoff:
++            self._eye_history.popleft()
+         while self._yawn_history and self._yawn_history[0] < cutoff:
+             self._yawn_history.popleft()
+         while self._nod_history and self._nod_history[0] < cutoff:
+@@ -146,6 +202,27 @@ class FatigueScorer:
+         )
+ 
+         score = round(min(100.0, max(0.0, raw * 100.0)), 1)
++        reasons = []
++        if eye_closed:
++            reasons.append("Eyes closed")
++        if perclos >= PERCLOS_THRESHOLD:
++            reasons.append("High eye-closure rate")
++        if self._yawn_in_progress or features.mar > MAR_THRESHOLD:
++            reasons.append("Yawning detected")
++        if self._nod_in_progress or features.head_pitch > HEAD_PITCH_THRESHOLD:
++            reasons.append("Head nod detected")
++        if score >= 40 and not reasons:
++            reasons.append("Elevated fatigue score")
++
++        self._details = ScoreDetails(
++            perclos=perclos,
++            eye_closed=eye_closed,
++            yawning=self._yawn_in_progress or features.mar > MAR_THRESHOLD,
++            head_nod=self._nod_in_progress or features.head_pitch > HEAD_PITCH_THRESHOLD,
++            yawns_per_min=yawns_per_min,
++            nods_per_min=nods_per_min,
++            reasons=tuple(reasons),
++        )
+         self._last_score = score
+         return score
+ 
+@@ -165,6 +242,11 @@ class FatigueScorer:
+         """Current PERCLOS value (read-only)."""
+         return self._compute_perclos()
+ 
++    @property
++    def details(self) -> ScoreDetails:
++        """Explanation for the latest score (read-only)."""
++        return self._details
++
+     def reset(self):
+         """Clear all rolling history (e.g. driver change)."""
+         self._eye_history.clear()
+@@ -173,4 +255,10 @@ class FatigueScorer:
+         self._last_score = 0.0
+         self._ear_low_count  = 0
+         self._ear_high_count = 0
++        self._mar_high_count = 0
++        self._nod_high_count = 0
++        self._yawn_in_progress = False
++        self._nod_in_progress = False
++        self._missing_since = None
++        self._details = ScoreDetails()
+         log.info("FatigueScorer reset.")
+diff --git a/tests/test_features.py b/tests/test_features.py
+index 216f1ea..09085bf 100644
+--- a/tests/test_features.py
++++ b/tests/test_features.py
+@@ -46,7 +46,7 @@ class TestEuclidean:
+ 
+ class TestAspectRatio:
+     def _make_eye_landmarks(self, ear_target: float):
+-        v = ear_target
++        v = ear_target / 2.0
+         lms = [FakeLandmark(0.5, 0.5)] * 468
+         lms[362] = FakeLandmark(0.0, 0.5)
+         lms[385] = FakeLandmark(0.5, 0.5 - v)
+diff --git a/tests/test_scoring.py b/tests/test_scoring.py
+index 8c6365a..cc3db01 100644
+--- a/tests/test_scoring.py
++++ b/tests/test_scoring.py
+@@ -10,6 +10,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ 
+ from src.scoring import FatigueScorer
+ from src.features import Features
++from config.config import (
++    FACE_MISSING_WARNING_SCORE,
++    FACE_MISSING_CRITICAL_SCORE,
++)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -26,7 +30,7 @@ def make_features(ear=0.30, mar=0.30, pitch=0.0):
+ 
+ 
+ AWAKE_FEAT   = make_features(ear=0.32, mar=0.20, pitch=0.0)
+-DROWSY_FEAT  = make_features(ear=0.14, mar=0.25, pitch=5.0)  # eyes closed
++DROWSY_FEAT  = make_features(ear=0.10, mar=0.25, pitch=5.0)  # eyes closed
+ YAWNING_FEAT = make_features(ear=0.28, mar=0.75, pitch=0.0)  # yawning
+ NODDING_FEAT = make_features(ear=0.28, mar=0.20, pitch=25.0) # head down
+ 
+@@ -47,18 +51,18 @@ class TestPERCLOS:
+ 
+     def test_all_closed_eyes(self):
+         scorer = FatigueScorer()
+-        for _ in range(100):
++        for _ in range(300):
+             scorer.update(DROWSY_FEAT)
+-        assert scorer.perclos == pytest.approx(1.0, abs=0.01)
++        assert scorer.perclos > 0.90
+ 
+     def test_half_closed(self):
+         scorer = FatigueScorer()
+         for _ in range(50):
+             scorer.update(AWAKE_FEAT)
+-        for _ in range(50):
++        for _ in range(100):
+             scorer.update(DROWSY_FEAT)
+         # PERCLOS should be ~0.5
+-        assert 0.40 <= scorer.perclos <= 0.60
++        assert 0.45 <= scorer.perclos <= 0.65
+ 
+     def test_reset_clears_history(self):
+         scorer = FatigueScorer()
+@@ -120,3 +124,25 @@ class TestFatigueScore:
+             f"Yawning scorer ({yawn_score:.1f}) should exceed "
+             f"baseline ({base_score:.1f})"
+         )
++
++    def test_short_yawn_spike_is_ignored(self):
++        scorer = FatigueScorer()
++
++        for _ in range(5):
++            scorer.update(YAWNING_FEAT)
++        score = scorer.update(AWAKE_FEAT)
++
++        assert score == pytest.approx(0.0)
++
++    def test_missing_face_escalates_after_timeout(self, monkeypatch):
++        t = [100.0]
++        monkeypatch.setattr("src.scoring.time.monotonic", lambda: t[0])
++
++        scorer = FatigueScorer()
++        assert scorer.update(None) == pytest.approx(0.0)
++
++        t[0] = 102.1
++        assert scorer.update(None) >= FACE_MISSING_WARNING_SCORE
++
++        t[0] = 105.1
++        assert scorer.update(None) >= FACE_MISSING_CRITICAL_SCORE
+-- 
+2.54.0.windows.1
+

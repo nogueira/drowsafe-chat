@@ -1,0 +1,108 @@
+"""
+DrowSAFE — Face detector module.
+
+Runs MediaPipe Face Mesh on each frame and returns the 468 facial
+landmarks normalised to [0, 1] in (x, y, z) coordinates.
+"""
+
+import cv2
+import mediapipe as mp
+import logging
+
+log = logging.getLogger("drowsafe.detector")
+
+
+class FaceDetector:
+    """
+    Wraps MediaPipe FaceMesh for single-face landmark detection.
+
+    MediaPipe returns 468 landmarks per face, each with:
+      - x, y  : normalised [0, 1] position relative to frame dimensions
+      - z     : relative depth (smaller = closer to camera)
+    """
+
+    def __init__(
+        self,
+        max_num_faces: int = 1,
+        refine_landmarks: bool = True,
+        min_detection_confidence: float = 0.5,
+        min_tracking_confidence: float = 0.5,
+    ):
+        self._mp_face_mesh = mp.solutions.face_mesh
+        self._mp_drawing   = mp.solutions.drawing_utils
+        self._mp_styles    = mp.solutions.drawing_styles
+
+        self._face_mesh = self._mp_face_mesh.FaceMesh(
+            max_num_faces            = max_num_faces,
+            refine_landmarks         = refine_landmarks,
+            min_detection_confidence = min_detection_confidence,
+            min_tracking_confidence  = min_tracking_confidence,
+        )
+
+        log.info(
+            "FaceDetector ready (max_faces=%d, refine=%s)",
+            max_num_faces, refine_landmarks,
+        )
+
+    def process(self, frame, draw: bool = True, annotation_frame=None):
+        """
+        Run face mesh detection on an RGB frame.
+
+        Parameters
+        ----------
+        frame : numpy.ndarray
+            RGB image used for detection.
+        draw : bool
+            Whether to draw landmarks for debug display.
+        annotation_frame : numpy.ndarray | None
+            Optional RGB frame to annotate. This may be larger than `frame`;
+            MediaPipe landmarks are normalised, so they scale correctly.
+
+        Returns
+        -------
+        landmarks : list of mediapipe.framework.formats.landmark_pb2.NormalizedLandmark
+            468 landmarks for the first detected face, or None if no face found.
+        annotated_frame : numpy.ndarray
+            Copy of the input frame with landmarks drawn (for debug display).
+        """
+        # Pass frame directly to MediaPipe (expects RGB, camera now outputs RGB).
+        # Avoiding a per-frame copy matters on the Pi 5.
+        rgb = frame
+        rgb.flags.writeable = False
+        results = self._face_mesh.process(rgb)
+        rgb.flags.writeable = True
+
+        if not results.multi_face_landmarks:
+            annotated = annotation_frame.copy() if (draw and annotation_frame is not None) else frame
+            return None, annotated
+
+        face_landmarks = results.multi_face_landmarks[0]
+
+        if not draw:
+            return face_landmarks.landmark, frame
+
+        # Draw landmarks only when requested. Use the original display frame
+        # when provided, otherwise annotate the processed frame.
+        annotated = annotation_frame.copy() if annotation_frame is not None else frame.copy()
+        self._mp_drawing.draw_landmarks(
+            image                        = annotated,
+            landmark_list                = face_landmarks,
+            connections                  = self._mp_face_mesh.FACEMESH_TESSELATION,
+            landmark_drawing_spec        = None,
+            connection_drawing_spec      = self._mp_styles
+                .get_default_face_mesh_tesselation_style(),
+        )
+        self._mp_drawing.draw_landmarks(
+            image                        = annotated,
+            landmark_list                = face_landmarks,
+            connections                  = self._mp_face_mesh.FACEMESH_CONTOURS,
+            landmark_drawing_spec        = None,
+            connection_drawing_spec      = self._mp_styles
+                .get_default_face_mesh_contours_style(),
+        )
+
+        return face_landmarks.landmark, annotated
+
+    def close(self):
+        self._face_mesh.close()
+        log.info("FaceDetector closed.")
