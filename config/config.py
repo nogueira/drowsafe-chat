@@ -95,5 +95,5 @@ LOG_DIR              = "logs"
 LOG_EVENTS           = True   # Write drowsiness events to timestamped CSV
 
 # --- Debug ---
-SHOW_LANDMARKS       = True   # Overlay MediaPipe mesh on camera feed (dev mode)
+SHOW_LANDMARKS       = False  # Overlay MediaPipe mesh on camera feed (debug mode)
 SHOW_FPS             = True   # Display FPS counter on dashboard

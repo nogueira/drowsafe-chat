@@ -328,6 +328,7 @@ def main():
                 fps         = fps_display if SHOW_FPS else None,
                 simulated   = simulate,
                 alert_reason= reason if alert_level > 0 else None,
+                perclos     = scorer.details.perclos,
             )
             time.sleep(1.0 / max(FRAME_RATE, 1))
             if not dashboard.is_running():
@@ -379,6 +380,7 @@ def main():
             fps         = fps_display if SHOW_FPS else None,
             simulated   = simulate,
             alert_reason= reason if alert_level > 0 else None,
+            perclos     = scorer.details.perclos,
         )
 
         if not dashboard.is_running():
